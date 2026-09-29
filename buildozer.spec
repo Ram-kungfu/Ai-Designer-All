@@ -7,7 +7,7 @@ source.include_exts = py,png,jpg,jpeg,kv,atlas,ttf,otf
 source.exclude_dirs = tests, bin, .git, .github
 version = 1.0
 
-requirements = python3,kivy==2.3.0,pillow,requests,urllib3,chardet,idna,certifi,fonttools,numpy,pyjnius
+
 
 orientation = portrait
 fullscreen = 0
