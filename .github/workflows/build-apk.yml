@@ -2,58 +2,44 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Setup Java JDK
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install system dependencies
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip \
-            autoconf libtool pkg-config zlib1g-dev libncurses5-dev \
-            libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev \
-            automake libltdl-dev
+          sudo apt-get install -y build-essential ccache git libffi-dev libssl-dev libxml2-dev libxslt1-dev zlib1g-dev python3-pip autoconf libtool pkg-config zip unzip
 
-      - name: Install Buildozer and Cython
+      - name: Install Buildozer & Cython
         run: |
           pip install --upgrade pip
-          pip install buildozer cython==0.29.36 virtualenv
+          pip install buildozer cython==0.29.33
 
-      - name: Accept Android SDK Licenses
+      - name: Build APK with Buildozer
         run: |
-          yes | sdkmanager --licenses || true
-          mkdir -p $HOME/.android
-          touch $HOME/.android/repositories.cfg
+          buildozer android debug
 
-      - name: Build APK
-        run: |
-          yes | buildozer android debug
-        env:
-          ANDROIDAPI: 31
-          ANDROIDMINAPI: 24
-
-      - name: Upload APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: AI-Design-Studio-APK
           path: bin/*.apk
-          retention-days: 30
