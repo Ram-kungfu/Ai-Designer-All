@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build APK
 
 on:
   push:
@@ -7,58 +7,21 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      # यह स्पेशल एक्शन सारे लाइसेंस और SDK का काम खुद करेगा
+      - name: Build with Buildozer
+        uses: ArtemSBulgakov/buildozer-action@v1
+        id: buildozer
         with:
-          python-version: '3.10'
-
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip \
-            autoconf libtool pkg-config zlib1g-dev libncurses5-dev \
-            libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev \
-            automake libltdl-dev
-
-      - name: Install Buildozer and Cython
-        run: |
-          pip install --upgrade pip
-          pip install buildozer cython==0.29.36 virtualenv
-
-      # यह स्टेप बिना कोई setup-android एक्शन इस्तेमाल किए सीधे लाइसेंस एक्सेप्ट करेगा
-      - name: Accept Android SDK Licenses
-        run: |
-          yes | sdkmanager --licenses || true
-          mkdir -p $HOME/.android
-          touch $HOME/.android/repositories.cfg
-
-      - name: Clear previous build cache
-        run: |
-          rm -rf .buildozer
-
-      - name: Build APK
-        run: |
-          yes | buildozer android debug
-        env:
-          ANDROIDAPI: 31
-          ANDROIDMINAPI: 24
+          command: buildozer android debug
+          buildozer_version: stable
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: AI-Design-Studio-APK
-          path: bin/*.apk
-          retention-days: 30
+          path: ${{ steps.buildozer.outputs.filename }}
