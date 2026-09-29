@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -25,13 +25,6 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # यहाँ setup-android के साथ accept-android-sdk-licenses: true भेजा गया है
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -45,21 +38,17 @@ jobs:
           pip install --upgrade pip
           pip install buildozer cython==0.29.36 virtualenv
 
-      # यह स्टेप जबरदस्ती लाइसेंस फाइलें बना देगा, ताकि buildozer को कोई दिक्कत न हो
-      - name: Force Accept Android SDK Licenses
+      # यह स्टेप बिना कोई setup-android एक्शन इस्तेमाल किए सीधे लाइसेंस एक्सेप्ट करेगा
+      - name: Accept Android SDK Licenses
         run: |
-          export ANDROID_HOME=$ANDROID_SDK_ROOT
-          mkdir -p $ANDROID_HOME/licenses
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          echo -e "\n8933bad161af4b6a5b573652ffc7aaf3aee85a47" > $ANDROID_HOME/licenses/android-sdk-license
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131b33910" > $ANDROID_HOME/licenses/android-sdk-preview-license
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > $ANDROID_HOME/licenses/google-tv-preview-license
+          yes | sdkmanager --licenses || true
+          mkdir -p $HOME/.android
+          touch $HOME/.android/repositories.cfg
 
       - name: Clear previous build cache
         run: |
           rm -rf .buildozer
 
-      # बिल्ड शुरू करें, साथ में 'yes' पाइप करें ताकि कोई भी प्रॉम्प्ट आए तो अपने आप 'y' चला जाए
       - name: Build APK
         run: |
           yes | buildozer android debug
