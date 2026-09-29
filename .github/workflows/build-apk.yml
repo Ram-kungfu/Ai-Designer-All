@@ -1,4 +1,4 @@
-name: Build APK
+name: Build Android APK
 
 on:
   push:
@@ -7,14 +7,15 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # यह स्पेशल एक्शन सारे लाइसेंस और SDK का काम खुद करेगा
       - name: Build with Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
+        uses: guysoft/buildozer-action@v1
         id: buildozer
         with:
           command: buildozer android debug
@@ -25,3 +26,4 @@ jobs:
         with:
           name: AI-Design-Studio-APK
           path: ${{ steps.buildozer.outputs.filename }}
+          retention-days: 30
