@@ -19,7 +19,6 @@ from kivy.uix.progressbar import ProgressBar
 from kivy.clock import Clock
 from kivy.core.window import Window
 from PIL import Image as PILImage, ImageDraw, ImageFont, ImageEnhance, ImageOps
-from rembg import remove
 
 # ============================================================
 # ---------- AI बैकएंड फंक्शन्स ----------
@@ -38,15 +37,17 @@ def generate_design(prompt, width=1024, height=1024):
 
 
 def remove_background(image_bytes):
-    """rembg से बैकग्राउंड हटाएं"""
+    """
+    फ्री API की मदद से बैकग्राउंड हटाएं।
+    नोट: rembg को हटा दिया गया है क्योंकि यह Android पर कंपाइल नहीं होता।
+    फिलहाल यह ओरिजिनल इमेज लौटाता है ताकि ऐप क्रैश न हो।
+    """
     try:
-        input_image = PILImage.open(io.BytesIO(image_bytes)).convert("RGBA")
-        output_image = remove(input_image)
-        buf = io.BytesIO()
-        output_image.save(buf, format='PNG')
-        return buf.getvalue()
+        # यहाँ आप भविष्य में कोई फ्री बैकग्राउंड रिमूवल API जोड़ सकते हैं
+        # जैसे remove.bg का फ्री टियर या कोई और सेवा
+        return image_bytes
     except Exception as e:
-        raise Exception(f"बैकग्राउंड रिमूवल फेल: {str(e)}")
+        return image_bytes
 
 
 def upscale_image(image_bytes, scale=2):
@@ -143,7 +144,7 @@ def flip_image(image_bytes, direction="horizontal"):
 
 
 def adjust_brightness(image_bytes, factor=1.0):
-    """ब्राइटनेस बदलें (0.5 = कम, 1.0 = सामान्य, 2.0 = ज्यादा)"""
+    """ब्राइटनेस बदलें"""
     try:
         img = PILImage.open(io.BytesIO(image_bytes)).convert("RGBA")
         enhancer = ImageEnhance.Brightness(img)
@@ -196,7 +197,6 @@ def convert_to_svg(image_bytes):
     """इमेज को SVG वेक्टर में बदलें (कटिंग के लिए)"""
     try:
         img = PILImage.open(io.BytesIO(image_bytes)).convert("RGBA")
-        # साइज़ कम करें ताकि SVG हल्का बने
         max_size = 500
         if max(img.size) > max_size:
             ratio = max_size / max(img.size)
@@ -208,7 +208,6 @@ def convert_to_svg(image_bytes):
         svg_parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">']
         svg_parts.append('<rect width="100%" height="100%" fill="white"/>')
 
-        # हर 4x4 ब्लॉक को एक rect बनाएं (SVG हल्का रहे)
         step = 4
         for y in range(0, height, step):
             for x in range(0, width, step):
@@ -229,7 +228,6 @@ def save_to_gallery(image_bytes):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"ai_design_{timestamp}.png"
 
-        # Android पाथ
         paths = [
             "/storage/emulated/0/Pictures",
             "/sdcard/Pictures",
@@ -261,36 +259,29 @@ class DesignApp(App):
         self.title = "AI Design Studio - Complete"
         Window.size = (400, 700)
 
-        # स्टेट
-        self.original_bytes = None     # AI से आया डिज़ाइन
-        self.current_bytes = None      # वर्तमान डिज़ाइन
-        self.history = []              # अनडू के लिए
+        self.original_bytes = None
+        self.current_bytes = None
+        self.history = []
         self.scale_factor = 2
 
-        # मुख्य लेआउट
         root = BoxLayout(orientation='vertical', padding=5, spacing=5)
 
-        # टैब्स
         tabs = TabbedPanel(do_default_tab=False)
         tabs.tab_width = 100
         tabs.tab_height = 40
 
-        # ---------- टैब 1: डिज़ाइन ----------
         tab1 = TabbedPanelItem(text="डिज़ाइन")
         tab1.content = self.build_design_tab()
         tabs.add_widget(tab1)
 
-        # ---------- टैब 2: एडिट ----------
         tab2 = TabbedPanelItem(text="एडिट")
         tab2.content = self.build_edit_tab()
         tabs.add_widget(tab2)
 
-        # ---------- टैब 3: टेक्स्ट ----------
         tab3 = TabbedPanelItem(text="टेक्स्ट")
         tab3.content = self.build_text_tab()
         tabs.add_widget(tab3)
 
-        # ---------- टैब 4: फिल्टर ----------
         tab4 = TabbedPanelItem(text="फिल्टर")
         tab4.content = self.build_filter_tab()
         tabs.add_widget(tab4)
@@ -298,11 +289,9 @@ class DesignApp(App):
         tabs.default_tab = tab1
         root.add_widget(tabs)
 
-        # ---------- प्रीव्यू ----------
         self.image_display = Image(size_hint_y=0.35)
         root.add_widget(self.image_display)
 
-        # ---------- स्टेटस + प्रोग्रेस ----------
         self.status_label = Label(text="तैयार", size_hint_y=0.05)
         root.add_widget(self.status_label)
 
@@ -311,9 +300,6 @@ class DesignApp(App):
 
         return root
 
-    # ============================================================
-    # ---------- टैब 1: डिज़ाइन ----------
-    # ============================================================
     def build_design_tab(self):
         scroll = ScrollView()
         layout = BoxLayout(orientation='vertical', padding=8, spacing=8, size_hint_y=None)
@@ -327,7 +313,6 @@ class DesignApp(App):
         )
         layout.add_widget(self.prompt_input)
 
-        # साइज़ चुनें
         layout.add_widget(Label(text="डिज़ाइन साइज़:", size_hint_y=None, height=25))
         self.size_spinner = Spinner(
             text='1024 x 1024',
@@ -336,7 +321,6 @@ class DesignApp(App):
         )
         layout.add_widget(self.size_spinner)
 
-        # अपस्केल
         layout.add_widget(Label(text="HD अपस्केल:", size_hint_y=None, height=25))
         self.upscale_spinner = Spinner(
             text='2x (तेज़)',
@@ -345,7 +329,6 @@ class DesignApp(App):
         )
         layout.add_widget(self.upscale_spinner)
 
-        # बटन
         self.generate_btn = Button(
             text="🚀 डिज़ाइन जनरेट करें",
             size_hint_y=None, height=55,
@@ -354,7 +337,6 @@ class DesignApp(App):
         self.generate_btn.bind(on_press=self.on_generate)
         layout.add_widget(self.generate_btn)
 
-        # सेव बटन
         self.save_btn = Button(
             text="💾 फाइनल सेव करें (Gallery)",
             size_hint_y=None, height=50,
@@ -363,7 +345,6 @@ class DesignApp(App):
         self.save_btn.bind(on_press=self.on_save)
         layout.add_widget(self.save_btn)
 
-        # SVG बटन
         self.svg_btn = Button(
             text="✂️ SVG (कटिंग फाइल) बनाएं",
             size_hint_y=None, height=50,
@@ -372,7 +353,6 @@ class DesignApp(App):
         self.svg_btn.bind(on_press=self.on_svg)
         layout.add_widget(self.svg_btn)
 
-        # शेयर बटन
         self.share_btn = Button(
             text="📤 WhatsApp पर शेयर करें",
             size_hint_y=None, height=45,
@@ -383,9 +363,6 @@ class DesignApp(App):
 
         return scroll_wrap(layout)
 
-    # ============================================================
-    # ---------- टैब 2: एडिट ----------
-    # ============================================================
     def build_edit_tab(self):
         scroll = ScrollView()
         layout = BoxLayout(orientation='vertical', padding=8, spacing=8, size_hint_y=None)
@@ -393,7 +370,6 @@ class DesignApp(App):
 
         layout.add_widget(Label(text="इमेज एडिट करें", size_hint_y=None, height=30, bold=True))
 
-        # रोटेट
         layout.add_widget(Label(text="घुमाएं (Rotate):", size_hint_y=None, height=25))
         rot_row = GridLayout(cols=4, size_hint_y=None, height=45, spacing=5)
         for angle in [0, 90, 180, 270]:
@@ -402,7 +378,6 @@ class DesignApp(App):
             rot_row.add_widget(btn)
         layout.add_widget(rot_row)
 
-        # फ्लिप
         layout.add_widget(Label(text="उल्टा करें (Flip):", size_hint_y=None, height=25))
         flip_row = GridLayout(cols=2, size_hint_y=None, height=45, spacing=5)
         h_btn = Button(text="↔️ हॉरिज़ॉन्टल")
@@ -413,7 +388,6 @@ class DesignApp(App):
         flip_row.add_widget(v_btn)
         layout.add_widget(flip_row)
 
-        # ब्राइटनेस
         layout.add_widget(Label(text="ब्राइटनेस:", size_hint_y=None, height=25))
         self.brightness_slider = Slider(min=0.3, max=2.0, value=1.0, size_hint_y=None, height=40)
         layout.add_widget(self.brightness_slider)
@@ -421,7 +395,6 @@ class DesignApp(App):
         b_btn.bind(on_press=lambda x: self.on_brightness(self.brightness_slider.value))
         layout.add_widget(b_btn)
 
-        # कंट्रास्ट
         layout.add_widget(Label(text="कंट्रास्ट:", size_hint_y=None, height=25))
         self.contrast_slider = Slider(min=0.3, max=2.0, value=1.0, size_hint_y=None, height=40)
         layout.add_widget(self.contrast_slider)
@@ -429,7 +402,6 @@ class DesignApp(App):
         c_btn.bind(on_press=lambda x: self.on_contrast(self.contrast_slider.value))
         layout.add_widget(c_btn)
 
-        # अनडू / रीसेट
         undo_row = GridLayout(cols=2, size_hint_y=None, height=50, spacing=5)
         undo_btn = Button(text="↩️ अनडू", background_color=(0.8, 0.6, 0.2, 1))
         undo_btn.bind(on_press=self.on_undo)
@@ -441,9 +413,6 @@ class DesignApp(App):
 
         return scroll_wrap(layout)
 
-    # ============================================================
-    # ---------- टैब 3: टेक्स्ट ----------
-    # ============================================================
     def build_text_tab(self):
         scroll = ScrollView()
         layout = BoxLayout(orientation='vertical', padding=8, spacing=8, size_hint_y=None)
@@ -451,7 +420,6 @@ class DesignApp(App):
 
         layout.add_widget(Label(text="डिज़ाइन पर टेक्स्ट लिखें", size_hint_y=None, height=30, bold=True))
 
-        # मुख्य टेक्स्ट
         layout.add_widget(Label(text="मुख्य टेक्स्ट (Main):", size_hint_y=None, height=25))
         self.main_text_input = TextInput(
             hint_text="जैसे: MY BRAND",
@@ -465,7 +433,6 @@ class DesignApp(App):
         )
         layout.add_widget(self.main_pos)
 
-        # सेकेंडरी टेक्स्ट
         layout.add_widget(Label(text="सेकेंडरी टेक्स्ट (Tagline):", size_hint_y=None, height=25))
         self.sub_text_input = TextInput(
             hint_text="जैसे: Best Quality Since 1990",
@@ -479,7 +446,6 @@ class DesignApp(App):
         )
         layout.add_widget(self.sub_pos)
 
-        # फॉन्ट साइज़
         layout.add_widget(Label(text="फॉन्ट साइज़:", size_hint_y=None, height=25))
         self.font_slider = Slider(min=20, max=200, value=80, size_hint_y=None, height=40)
         layout.add_widget(self.font_slider)
@@ -487,7 +453,6 @@ class DesignApp(App):
         layout.add_widget(self.font_value_label)
         self.font_slider.bind(value=lambda x, v: setattr(self.font_value_label, 'text', str(int(v))))
 
-        # टेक्स्ट कलर
         layout.add_widget(Label(text="टेक्स्ट कलर:", size_hint_y=None, height=25))
         self.text_color_spinner = Spinner(
             text='White',
@@ -496,7 +461,6 @@ class DesignApp(App):
         )
         layout.add_widget(self.text_color_spinner)
 
-        # आउटलाइन कलर
         layout.add_widget(Label(text="आउटलाइन कलर:", size_hint_y=None, height=25))
         self.stroke_color_spinner = Spinner(
             text='Black',
@@ -505,7 +469,6 @@ class DesignApp(App):
         )
         layout.add_widget(self.stroke_color_spinner)
 
-        # टेक्स्ट जोड़ें बटन
         add_btn = Button(
             text="✅ टेक्स्ट जोड़ें",
             size_hint_y=None, height=55,
@@ -514,7 +477,6 @@ class DesignApp(App):
         add_btn.bind(on_press=self.on_add_text)
         layout.add_widget(add_btn)
 
-        # दोनों टेक्स्ट एक साथ
         both_btn = Button(
             text="⚡ दोनों टेक्स्ट एक साथ जोड़ें",
             size_hint_y=None, height=50,
@@ -525,9 +487,6 @@ class DesignApp(App):
 
         return scroll_wrap(layout)
 
-    # ============================================================
-    # ---------- टैब 4: फिल्टर ----------
-    # ============================================================
     def build_filter_tab(self):
         layout = BoxLayout(orientation='vertical', padding=8, spacing=8)
 
@@ -543,11 +502,7 @@ class DesignApp(App):
 
         return layout
 
-    # ============================================================
-    # ---------- एक्शन फंक्शन्स ----------
-    # ============================================================
     def push_history(self):
-        """अनडू के लिए हिस्ट्री में सेव करें"""
         if self.current_bytes:
             self.history.append(self.current_bytes)
             if len(self.history) > 20:
@@ -582,18 +537,15 @@ class DesignApp(App):
     def toggle_buttons(self, enabled):
         Clock.schedule_once(lambda dt: setattr(self.generate_btn, 'disabled', not enabled))
 
-    # ---------- जनरेशन ----------
     def on_generate(self, instance):
         prompt = self.prompt_input.text.strip()
         if not prompt:
             self.show_popup("कृपया डिज़ाइन का विवरण लिखें")
             return
 
-        # साइज़
         size_str = self.size_spinner.text
         w, h = [int(x.strip()) for x in size_str.split("x")]
 
-        # अपस्केल
         up_text = self.upscale_spinner.text
         if up_text.startswith("1x"):
             self.scale_factor = 1
@@ -636,7 +588,6 @@ class DesignApp(App):
         finally:
             self.toggle_buttons(True)
 
-    # ---------- टेक्स्ट ----------
     def _parse_color(self, name):
         colors = {
             "White": (255, 255, 255, 255),
@@ -715,7 +666,6 @@ class DesignApp(App):
         except Exception as e:
             self.show_popup(f"त्रुटि: {str(e)}")
 
-    # ---------- एडिट ----------
     def on_rotate(self, angle):
         if not self.current_bytes:
             self.show_popup("पहले डिज़ाइन बनाएं")
@@ -792,7 +742,6 @@ class DesignApp(App):
             self.show_image(self.current_bytes)
             self.update_status("रीसेट हो गया")
 
-    # ---------- सेव / SVG / शेयर ----------
     def on_save(self, instance):
         if not self.current_bytes:
             self.show_popup("पहले डिज़ाइन बनाएं")
@@ -840,7 +789,6 @@ class DesignApp(App):
             return
         try:
             path = save_to_gallery(self.current_bytes)
-            # Android शेयर इंटेंट
             try:
                 from jnius import autoclass
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
@@ -861,7 +809,6 @@ class DesignApp(App):
 
 
 def scroll_wrap(layout):
-    """ScrollView में लेआउट को लपेटें"""
     scroll = ScrollView()
     scroll.add_widget(layout)
     return scroll
