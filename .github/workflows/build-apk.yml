@@ -44,10 +44,6 @@ jobs:
           mkdir -p $HOME/.android
           touch $HOME/.android/repositories.cfg
 
-      - name: Clear previous build cache
-        run: |
-          rm -rf .buildozer
-
       - name: Build APK
         run: |
           yes | buildozer android debug
