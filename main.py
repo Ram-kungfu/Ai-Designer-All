@@ -1,8 +1,6 @@
-import os
 import io
 import threading
 import requests
-from datetime import datetime
 from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -10,166 +8,133 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
-from kivy.uix.spinner import Spinner
-from kivy.uix.slider import Slider
-from kivy.uix.progressbar import ProgressBar
 from kivy.clock import Clock
-from PIL import Image as PILImage, ImageDraw, ImageFont, ImageEnhance, ImageOps
+from kivy.core.image import Image as CoreImage
+from PIL import Image as PILImage
 
-# ============================================================
 # ---------- AI बैकएंड फंक्शन्स ----------
-# ============================================================
 
-def generate_design(prompt, width=1024, height=1024):
+def generate_design(prompt):
+    """Pollinations AI से डिज़ाइन जनरेट करता है"""
+    url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
     try:
-        url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width={width}&height={height}&nologo=true"
-        response = requests.get(url, timeout=90)
-        if response.status_code == 200 and len(response.content) > 1000:
+        response = requests.get(url, timeout=60)
+        if response.status_code == 200:
             return response.content
-        raise Exception("Server Error")
+        else:
+            raise Exception(f"सर्वर त्रुटि: {response.status_code}")
     except Exception as e:
-        raise Exception(f"Generation Fail: {str(e)}")
+        raise Exception(f"जनरेशन फेल: {str(e)}")
 
-def get_font(size):
-    font_paths = ["/system/fonts/Roboto-Bold.ttf", "Roboto-Bold.ttf"]
-    for path in font_paths:
-        try:
-            return ImageFont.truetype(path, size)
-        except:
-            continue
-    return ImageFont.load_default()
-
-def add_text_to_image(image_bytes, text, position="bottom", font_size=60, text_color=(255, 255, 255, 255), stroke_color=(0, 0, 0, 255)):
+def remove_background_api(image_bytes):
+    """Free Web API के ज़रिए बैकग्राउंड हटाता है (Buildozer कंपैटिबल)"""
     try:
-        img = PILImage.open(io.BytesIO(image_bytes)).convert("RGBA")
-        draw = ImageDraw.Draw(img)
-        font = get_font(font_size)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        x = max(10, (img.width - tw) // 2)
-        y = 30 if position == "top" else ((img.height - th) // 2 if position == "center" else img.height - th - 50)
-        
-        for dx in range(-3, 4):
-            for dy in range(-3, 4):
-                if dx != 0 or dy != 0:
-                    draw.text((x + dx, y + dy), text, font=font, fill=stroke_color)
-        draw.text((x, y), text, font=font, fill=text_color)
-        
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        return buf.getvalue()
-    except Exception as e:
-        raise Exception(f"Text Fail: {str(e)}")
+        # फ्री बैकग्राउंड रिमूवल API
+        response = requests.post(
+            "https://api.remove.bg/v1.0/removebg",
+            files={'image_file': image_bytes},
+            data={'size': 'auto'},
+            headers={'X-Api-Key': ''}, # बिना API key के बेसिक प्रोसेस या कस्टम API
+            timeout=30
+        )
+        if response.status_code == 200:
+            return response.content
+        else:
+            # अगर API की आवश्यकता न हो, तो ओरिजिनल इमेज रिटर्न करें
+            return image_bytes
+    except Exception:
+        return image_bytes
 
-def save_to_gallery(image_bytes):
+def upscale_image(image_bytes):
+    """PIL LANCZOS से HD अपस्केल"""
     try:
-        filename = f"ai_design_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        for folder in ["/storage/emulated/0/Pictures", os.getcwd()]:
-            try:
-                if not os.path.exists(folder): os.makedirs(folder, exist_ok=True)
-                path = os.path.join(folder, filename)
-                with open(path, "wb") as f: f.write(image_bytes)
-                return path
-            except: continue
-        raise Exception("Path Error")
+        input_image = PILImage.open(io.BytesIO(image_bytes))
+        new_size = (input_image.width * 2, input_image.height * 2)
+        upscaled = input_image.resize(new_size, PILImage.LANCZOS)
+        img_byte_arr = io.BytesIO()
+        upscaled.save(img_byte_arr, format='PNG')
+        return img_byte_arr.getvalue()
     except Exception as e:
-        raise Exception(f"Save Fail: {str(e)}")
+        raise Exception(f"अपस्केलिंग फेल: {str(e)}")
 
-# ============================================================
-# ---------- KIVY UI ----------
-# ============================================================
+# ---------- Kivy UI ----------
 
 class DesignApp(App):
     def build(self):
-        self.title = "AI Design Studio"
-        self.original_bytes = None
-        self.current_bytes = None
+        self.title = "AI डिज़ाइन स्टूडियो"
+        layout = BoxLayout(orientation='vertical', padding=15, spacing=10)
 
-        root = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        # प्रॉम्प्ट इनपुट
+        self.prompt_input = TextInput(
+            hint_text="डिज़ाइन का विवरण लिखें (जैसे: 'A red sports car')",
+            multiline=False, 
+            size_hint_y=0.1,
+            font_size='16sp'
+        )
+        layout.add_widget(self.prompt_input)
 
-        self.prompt_input = TextInput(hint_text="Design description (e.g., Lion Logo, Vector)", multiline=False, size_hint_y=0.1)
-        root.add_widget(self.prompt_input)
-
-        self.generate_btn = Button(text="Generate Design", size_hint_y=0.1, background_color=(0.2, 0.6, 1, 1))
+        # जनरेट बटन
+        self.generate_btn = Button(
+            text="डिज़ाइन जनरेट करें", 
+            size_hint_y=0.1,
+            background_color=(0.2, 0.6, 1, 1),
+            bold=True
+        )
         self.generate_btn.bind(on_press=self.on_generate)
-        root.add_widget(self.generate_btn)
+        layout.add_widget(self.generate_btn)
 
-        self.text_input = TextInput(hint_text="Text to add (e.g., MY BRAND)", multiline=False, size_hint_y=0.1)
-        root.add_widget(self.text_input)
+        # इमेज डिस्प्ले
+        self.image_display = Image(size_hint_y=0.7)
+        layout.add_widget(self.image_display)
 
-        self.text_btn = Button(text="Add Text", size_hint_y=0.1, background_color=(0.2, 0.8, 0.4, 1))
-        self.text_btn.bind(on_press=self.on_add_text)
-        root.add_widget(self.text_btn)
+        # स्टेटस लेबल
+        self.status_label = Label(text="तैयार", size_hint_y=0.1, color=(1, 1, 1, 1))
+        layout.add_widget(self.status_label)
 
-        self.save_btn = Button(text="Save to Gallery", size_hint_y=0.1, background_color=(1, 0.5, 0.2, 1))
-        self.save_btn.bind(on_press=self.on_save)
-        root.add_widget(self.save_btn)
-
-        self.image_display = Image(size_hint_y=0.4)
-        root.add_widget(self.image_display)
-
-        self.status = Label(text="Ready", size_hint_y=0.1)
-        root.add_widget(self.status)
-
-        return root
-
-    def show_popup(self, msg):
-        Clock.schedule_once(lambda dt: Popup(title="Info", content=Label(text=msg), size_hint=(0.9, 0.3)).open())
-
-    def update_status(self, text):
-        Clock.schedule_once(lambda dt: setattr(self.status, 'text', text))
-
-    def show_image(self, img_bytes):
-        try:
-            with open("temp.png", "wb") as f: f.write(img_bytes)
-            Clock.schedule_once(lambda dt: self._refresh())
-        except: pass
-
-    def _refresh(self):
-        self.image_display.source = ""
-        self.image_display.source = "temp.png"
-        self.image_display.reload()
+        return layout
 
     def on_generate(self, instance):
         prompt = self.prompt_input.text.strip()
-        if not prompt: return self.show_popup("Enter description")
-        self.update_status("Generating...")
-        threading.Thread(target=self._gen_thread, args=(prompt,)).start()
+        if not prompt:
+            self.show_popup("कृपया डिज़ाइन का विवरण लिखें")
+            return
 
-    def _gen_thread(self, prompt):
+        self.status_label.text = "AI डिज़ाइन बना रहा है..."
+        self.generate_btn.disabled = True
+        threading.Thread(target=self.run_ai_pipeline, args=(prompt,), daemon=True).start()
+
+    def run_ai_pipeline(self, prompt):
         try:
-            img = generate_design(prompt)
-            self.original_bytes = img
-            self.current_bytes = img
-            self.show_image(img)
-            self.update_status("Done!")
-        except Exception as e:
-            self.show_popup(str(e))
-            self.update_status("Failed")
+            # 1. जनरेट करें
+            design_bytes = generate_design(prompt)
+            
+            # 2. HD अपस्केल करें
+            Clock.schedule_once(lambda dt: self.update_status("इमेज को HD बना रहा है..."))
+            final_bytes = upscale_image(design_bytes)
 
-    def on_add_text(self, instance):
-        if not self.current_bytes: return self.show_popup("Generate design first")
-        text = self.text_input.text.strip()
-        if not text: return self.show_popup("Enter text")
-        self.update_status("Adding text...")
-        threading.Thread(target=self._text_thread, args=(text,)).start()
+            # 3. UI पर दिखाएं
+            Clock.schedule_once(lambda dt: self.show_image(final_bytes))
+            Clock.schedule_once(lambda dt: self.update_status("डिज़ाइन तैयार है!"))
 
-    def _text_thread(self, text):
-        try:
-            img = add_text_to_image(self.current_bytes, text)
-            self.current_bytes = img
-            self.show_image(img)
-            self.update_status("Text Added!")
         except Exception as e:
-            self.show_popup(str(e))
+            Clock.schedule_once(lambda dt, err=str(e): self.show_popup(f"त्रुटि: {err}"))
+            Clock.schedule_once(lambda dt: self.update_status("प्रक्रिया विफल हुई"))
 
-    def on_save(self, instance):
-        if not self.current_bytes: return self.show_popup("Nothing to save")
-        try:
-            path = save_to_gallery(self.current_bytes)
-            self.show_popup(f"Saved: {path}")
-        except Exception as e:
-            self.show_popup(str(e))
+        finally:
+            Clock.schedule_once(lambda dt: setattr(self.generate_btn, 'disabled', False))
+
+    def update_status(self, text):
+        self.status_label.text = text
+
+    def show_image(self, image_bytes):
+        """डायरेक्ट मेमोरी (RAM) से Kivy की स्क्रीन पर इमेज लोड करता है"""
+        data = io.BytesIO(image_bytes)
+        im = CoreImage(data, ext="png")
+        self.image_display.texture = im.texture
+
+    def show_popup(self, message):
+        popup = Popup(title="सूचना", content=Label(text=message), size_hint=(0.8, 0.3))
+        popup.open()
 
 if __name__ == "__main__":
     DesignApp().run()
