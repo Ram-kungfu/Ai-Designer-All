@@ -2,7 +2,6 @@ import os
 import io
 import json
 import time
-import math
 import base64
 import threading
 import requests
@@ -27,14 +26,17 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.popup import Popup
 from kivy.utils import platform, escape_markup
 from PIL import (Image as PILImage, ImageOps, ImageFilter, ImageDraw,
-                 ImageChops, ImageEnhance)
+                 ImageChops)
 
 # ================= आपकी keys =================
 REMOVEBG_KEY = "tTqBYQZHyFSMgQW6Mkzf2sSc"
 DEEPAI_KEY = "89091b06-226d-414a-94c4-347457d9c8c1"
 GEMINI_KEY = "AQ.Ab8RN6JE6Qll-WBJezPVuTr9ntLAhQTbS7yZDef6oetjPaTF_g"
+VECTORIZER_ID = "vktcf6i92nbgp2f"
+VECTORIZER_SECRET = "tovebgr66k30if7i3a0or1fiml2qr8804k222sfnnd0p3lu395gn"
 GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 GEMINI_TEXT_MODEL = "gemini-3.5-flash"
+FLIP_TEXT = False   # टेक्स्ट उल्टा दिखे तो True कर दें
 # ==============================================
 
 Window.softinput_mode = "below_target"
@@ -45,10 +47,24 @@ HAS_FONT = os.path.exists(FONT_PATH)
 
 COLORS = {
     "White": (255, 255, 255), "Black": (0, 0, 0), "Red": (230, 30, 30),
-    "Yellow": (255, 220, 0), "Blue": (20, 80, 220),
-    "Green": (20, 160, 60), "Orange": (255, 140, 0), "Purple": (150, 50, 200),
-    "Pink": (255, 105, 180), "Cyan": (0, 200, 200)
+    "Yellow": (255, 220, 0), "Blue": (20, 80, 220), "Green": (20, 160, 60),
+    "Orange": (255, 140, 0), "Purple": (150, 50, 200),
+    "Pink": (255, 105, 180), "Cyan": (0, 200, 200),
 }
+# कैनवास: (पिक्सेल साइज़, Gemini aspect, Pollinations साइज़)
+CANVAS_META = {
+    "Portrait 2:3": ((2000, 3000), "2:3", (1024, 1536)),
+    "Square 1:1": ((2400, 2400), "1:1", (1024, 1024)),
+    "Landscape 3:2": ((3000, 2000), "3:2", (1536, 1024)),
+}
+BG_COLORS = {
+    "Transparent": None, "White": (255, 255, 255, 255),
+    "Black": (0, 0, 0, 255), "Red": (200, 30, 30, 255),
+    "Blue": (20, 60, 180, 255), "Green": (20, 140, 60, 255),
+    "Yellow": (250, 220, 40, 255),
+}
+BG_SUFFIX = (". Background design only, vibrant, professional, no people, "
+             "no text, empty space in the center.")
 REQ_GALLERY = 4101
 REQ_CAMERA = 4102
 GEM_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -86,29 +102,37 @@ def to_bytes(img, fmt="PNG", dpi=None):
     return out.getvalue()
 
 
-def flatten_white(img):
-    bg = PILImage.new("RGB", img.size, (255, 255, 255))
+def flatten_on(img, rgb=(255, 255, 255)):
+    bg = PILImage.new("RGB", img.size, rgb)
     bg.paste(img, mask=img.convert("RGBA").split()[3])
     return bg
 
 
-def enhance_for_print(img, target=3000):
+def flatten_white(img):
+    return flatten_on(img, (255, 255, 255))
+
+
+def sharpen(img):
+    r, g, b, a = img.convert("RGBA").split()
+    rgb = PILImage.merge("RGB", (r, g, b)).filter(
+        ImageFilter.UnsharpMask(radius=1.2, percent=60, threshold=3))
+    r, g, b = rgb.split()
+    return PILImage.merge("RGBA", (r, g, b, a))
+
+
+def enhance_local(img, target=3000):
     rgba = img.convert("RGBA")
     long_side = max(rgba.size)
     if long_side < target:
         s = min(4.0, target / float(long_side))
         rgba = rgba.resize((int(rgba.width * s), int(rgba.height * s)),
                            PILImage.LANCZOS)
-    r, g, b, a = rgba.split()
-    rgb = PILImage.merge("RGB", (r, g, b)).filter(
-        ImageFilter.UnsharpMask(radius=1.6, percent=110, threshold=3))
-    r, g, b = rgb.split()
-    return PILImage.merge("RGBA", (r, g, b, a))
+    return sharpen(rgba)
 
 
-def make_pdf(img):
+def make_pdf(rgb_img):
     out = io.BytesIO()
-    flatten_white(img).save(out, "PDF", resolution=300.0)
+    rgb_img.save(out, "PDF", resolution=300.0)
     return out.getvalue()
 
 
@@ -155,44 +179,28 @@ def img_part(img):
                             "data": base64.b64encode(jpg).decode()}}
 
 
-def gemini_edit(img, prompt, mode="full", reference_img=None):
-    """
-    mode = "object"  → सिर्फ ऑब्जेक्ट का रंग बदलेगा (बैकग्राउंड सुरक्षित)
-    mode = "background" → सिर्फ बैकग्राउंड बदलेगा (ऑब्जेक्ट सुरक्षित)
-    mode = "full"   → पूरी इमेज बदलेगी
-    """
+def gemini_edit(img, prompt, mode="full"):
+    """mode='object': सिर्फ़ बताया हुआ बदलाव, शेप/पारदर्शिता वही रहती है"""
     if mode == "object":
         full_prompt = (
-            prompt + ". IMPORTANT: Only change the color of the specified object. "
-            "Keep the background, transparency, and everything else exactly the same. "
-            "Do NOT add any new background. The output must have a transparent "
-            "background where the original was transparent."
-        )
-    elif mode == "background":
-        full_prompt = (
-            prompt + ". IMPORTANT: Only change the background. "
-            "Keep the main object exactly as it is — same position, same colors, "
-            "same shape. Do NOT change the object. Only replace the background "
-            "with the new design/color described."
-        )
+            prompt + ". IMPORTANT: Only change what is described (for example "
+            "the color of the specified object). Keep the shape, details, "
+            "position and everything else exactly the same. Plain white "
+            "background.")
     else:
         full_prompt = prompt + ". Keep it high quality and print ready."
-
     data = gemini_call(GEMINI_IMAGE_MODEL,
                        [{"text": full_prompt}, img_part(img)],
                        {"responseModalities": ["TEXT", "IMAGE"]})
     out = gemini_image_from(data)
     if out is None:
         raise Exception("Gemini returned no image")
-
     out = out.convert("RGBA")
-
     if mode == "object":
-        orig_alpha = img.split()[3]
+        a = img.convert("RGBA").split()[3]
         if out.size != img.size:
-            orig_alpha = orig_alpha.resize(out.size, PILImage.LANCZOS)
-        out.putalpha(orig_alpha)
-
+            out = out.resize(img.size, PILImage.LANCZOS)
+        out.putalpha(a)
     return out
 
 
@@ -334,76 +342,29 @@ def hd_upscale(img):
         hd.putalpha(alpha.resize(hd.size, PILImage.LANCZOS))
         return hd, "DeepAI"
     except Exception as e:
-        return enhance_for_print(img, 3000), "Local (DeepAI: " + str(e)[:70] + ")"
+        return enhance_local(img, 3000), "Local (DeepAI: " + str(e)[:70] + ")"
 
 
-# ---------------- डिज़ाइन बनाना ----------------
-
-def compose_design(bg, person, size_pct, xpct, ypct):
-    bg = bg.convert("RGBA")
-    if bg.height < 3000:
-        s = 3072.0 / bg.height
-        bg = bg.resize((int(bg.width * s), 3072), PILImage.LANCZOS)
-    p = person.convert("RGBA")
-    ph = int(bg.height * size_pct / 100.0)
-    r = ph / float(p.height)
-    pw = int(p.width * r)
-    if pw > bg.width * 0.98:
-        r = bg.width * 0.98 / p.width
-        pw, ph = int(p.width * r), int(p.height * r)
-    p = p.resize((max(1, pw), max(1, ph)), PILImage.LANCZOS)
-    x0 = int(bg.width * xpct / 100.0 - pw / 2.0)
-    y0 = int(bg.height * ypct / 100.0 - ph / 2.0)
-    a = p.split()[3]
-    sh = a.filter(ImageFilter.GaussianBlur(max(2, ph / 70.0))).point(
-        lambda v: int(v * 0.45))
-    out = bg.copy()
-    out.paste(PILImage.new("RGBA", p.size, (0, 0, 0, 255)),
-              (x0 + int(pw * 0.02), y0 + int(ph * 0.02)), sh)
-    out.paste(p, (x0, y0), a)
-    return out
+def vectorize_pdf(img_rgba):
+    if not (key_ok(VECTORIZER_ID) and key_ok(VECTORIZER_SECRET)):
+        raise Exception("Vectorizer keys not set")
+    flat = flatten_white(img_rgba)
+    px = flat.width * flat.height
+    if px > 3000000:
+        s = (3000000.0 / px) ** 0.5
+        flat = flat.resize((int(flat.width * s), int(flat.height * s)),
+                           PILImage.LANCZOS)
+    r = requests.post(
+        "https://api.vectorizer.ai/api/v1/vectorize",
+        files={"image": ("design.png", to_bytes(flat, "PNG"))},
+        data={"output.file_format": "pdf"},
+        auth=(VECTORIZER_ID, VECTORIZER_SECRET), timeout=240)
+    if r.status_code == 200:
+        return r.content
+    raise Exception(f"Vectorizer {r.status_code}: {r.text[:120]}")
 
 
-def make_multi_layer_design(base_img, cuts):
-    """
-    base_img: बैकग्राउंड या बेस इमेज
-    cuts: [{"img": person_img, "size": 74, "x": 50, "y": 60}, ...]
-    कटे हुए भागों को अलग-अलग लेयर की तरह base पर लगाएं
-    """
-    out = base_img.convert("RGBA")
-    for item in cuts:
-        p = item["img"]
-        out = compose_design(out, p, item.get("size", 74),
-                             item.get("x", 50), item.get("y", 60))
-    return out
-
-
-def design_on_cut(cut_img, prompt):
-    """
-    कटे हुए भाग पर AI से नया डिज़ाइन बनाएं (बैकग्राउंड ट्रांसपेरेंट रहेगा)
-    """
-    full_prompt = (
-        "This is a cut-out object with transparent background. "
-        "Re-design the object itself with this description: " + prompt + ". "
-        "IMPORTANT: Keep the background transparent. Do NOT add any background. "
-        "Keep the exact same shape and silhouette of the object."
-    )
-    data = gemini_call(GEMINI_IMAGE_MODEL,
-                       [{"text": full_prompt}, img_part(cut_img)],
-                       {"responseModalities": ["TEXT", "IMAGE"]})
-    out = gemini_image_from(data)
-    if out is None:
-        raise Exception("Gemini returned no image")
-    out = out.convert("RGBA")
-    # ओरिजिनल अल्फा वापस लगाएं ताकि शेप बनी रहे
-    orig_alpha = cut_img.split()[3]
-    if out.size != cut_img.size:
-        orig_alpha = orig_alpha.resize(out.size, PILImage.LANCZOS)
-    out.putalpha(orig_alpha)
-    return out
-
-
-# ---------------- टेक्स्ट रेंडर (रोटेशन और कर्व के साथ) ----------------
+# ---------------- टेक्स्ट रेंडर (हिंदी + English) ----------------
 
 def _is_deva(ch):
     return "\u0900" <= ch <= "\u097F" or ch in ("\u200c", "\u200d")
@@ -430,8 +391,8 @@ def split_runs(line):
     return runs
 
 
-def render_run(text, is_deva, px, font_name=None):
-    font = font_name or (FONT_PATH if (is_deva and HAS_FONT) else "Roboto")
+def render_run(text, is_deva, px):
+    font = FONT_PATH if (is_deva and HAS_FONT) else "Roboto"
     cl = CoreLabel(text=text, font_size=px, font_name=font, color=(1, 1, 1, 1))
     cl.refresh()
     tex = cl.texture
@@ -439,11 +400,13 @@ def render_run(text, is_deva, px, font_name=None):
         return PILImage.new("L", (max(2, px // 3), px), 0)
     w, h = tex.size
     im = PILImage.frombytes("RGBA", (w, h), tex.pixels)
+    if FLIP_TEXT:
+        im = im.transpose(PILImage.FLIP_TOP_BOTTOM)
     return im.split()[3]
 
 
-def render_line(line, px, font_name=None):
-    masks = [render_run(t, d, px, font_name) for d, t in split_runs(line)]
+def render_line(line, px):
+    masks = [render_run(t, d, px) for d, t in split_runs(line)]
     if not masks:
         return None
     w = sum(m.width for m in masks)
@@ -456,8 +419,8 @@ def render_line(line, px, font_name=None):
     return out
 
 
-def render_text_block(text, px, font_name=None):
-    ims = [render_line(l, px, font_name) for l in text.split("\n") if l.strip()]
+def render_text_block(text, px):
+    ims = [render_line(l, px) for l in text.split("\n") if l.strip()]
     ims = [i for i in ims if i is not None]
     if not ims:
         return None
@@ -472,39 +435,103 @@ def render_text_block(text, px, font_name=None):
     return out
 
 
-def rotate_mask(mask, angle):
-    if angle == 0:
-        return mask
-    return mask.rotate(angle, expand=True, resample=PILImage.BICUBIC, fillcolor=0)
-
-
-def apply_text(base, text, color, outline, size_pct, xpct, ypct, angle=0, font_name=None):
-    img = base.copy().convert("RGBA")
-    px = max(14, int(img.height * size_pct / 100.0))
-    mask = render_text_block(text, px, font_name)
+def make_text_image(text, color, outline, px=260):
+    """टेक्स्ट को पारदर्शी RGBA इमेज (लेयर) में बदलता है"""
+    mask = render_text_block(text, px)
     if mask is None:
-        return img
-
-    mask = rotate_mask(mask, angle)
-
-    maxw = int(img.width * 0.95)
-    if mask.width > maxw:
-        r = maxw / float(mask.width)
-        mask = mask.resize((maxw, max(1, int(mask.height * r))), PILImage.LANCZOS)
-    pad = int(px * 0.2) if outline != "No outline" else 0
-    if pad:
-        mask = ImageOps.expand(mask, border=pad, fill=0)
-    x0 = int(img.width * xpct / 100.0 - mask.width / 2.0)
-    y0 = int(img.height * ypct / 100.0 - mask.height / 2.0)
-    x0 = max(0, min(img.width - mask.width, x0))
-    y0 = max(0, min(img.height - mask.height, y0))
-    if pad:
+        raise Exception("Text render failed")
+    pad = int(px * 0.2) if outline != "No outline" else int(px * 0.05)
+    mask = ImageOps.expand(mask, border=pad, fill=0)
+    txt = PILImage.new("RGBA", mask.size, color + (255,))
+    txt.putalpha(mask)
+    if outline != "No outline":
         oc = (0, 0, 0) if outline.startswith("Black") else (255, 255, 255)
         om = mask.filter(ImageFilter.GaussianBlur(max(1, px / 18.0))).point(
-            lambda v: 255 if v > 8 else 0)
-        img.paste(PILImage.new("RGBA", mask.size, oc + (255,)), (x0, y0), om)
-    img.paste(PILImage.new("RGBA", mask.size, color + (255,)), (x0, y0), mask)
-    return img
+            lambda v: 255 if v > 8 else 0).filter(ImageFilter.GaussianBlur(1))
+        ol = PILImage.new("RGBA", mask.size, oc + (255,))
+        ol.putalpha(om)
+        out = PILImage.alpha_composite(ol, txt)
+    else:
+        out = txt
+    bbox = out.getbbox()
+    if bbox:
+        out = out.crop(bbox)
+    return out
+
+
+# ---------------- लेयर सिस्टम ----------------
+
+def new_layer(img, name, kind="image", fill=False, src=None,
+              size=60.0, x=50.0, y=50.0):
+    return {"img": img, "src": src, "name": name, "kind": kind, "fill": fill,
+            "size": float(size), "x": float(x), "y": float(y), "rot": 0.0,
+            "visible": True, "hist": [], "prev": None}
+
+
+def layer_prev(L):
+    if L["prev"] is None:
+        p = L["img"].copy()
+        p.thumbnail((1100, 1100), PILImage.LANCZOS)
+        L["prev"] = p
+    return L["prev"]
+
+
+def fit_pct(img, wh):
+    cw, ch = wh
+    ar = img.width / float(img.height)
+    return max(5.0, min(95.0, 95.0 * cw / (ar * ch)))
+
+
+_CHK = {}
+
+
+def checker(size):
+    if size not in _CHK:
+        w, h = size
+        im = PILImage.new("RGBA", size, (215, 215, 215, 255))
+        d = ImageDraw.Draw(im)
+        t = 20
+        for yy in range(0, h, t):
+            for xx in range(0, w, t):
+                if ((xx // t) + (yy // t)) % 2 == 0:
+                    d.rectangle((xx, yy, xx + t - 1, yy + t - 1),
+                                fill=(245, 245, 245, 255))
+        _CHK.clear()
+        _CHK[size] = im
+    return _CHK[size]
+
+
+def render_canvas(layers, canvas_wh, bg_rgba, scale, use_prev):
+    W, H = canvas_wh
+    cw, ch = max(1, int(W * scale)), max(1, int(H * scale))
+    out = PILImage.new("RGBA", (cw, ch), bg_rgba if bg_rgba else (0, 0, 0, 0))
+    for L in layers:
+        if not L["visible"]:
+            continue
+        img = layer_prev(L) if use_prev else L["img"]
+        if img is None:
+            continue
+        if L["fill"]:
+            r = max(cw / float(img.width), ch / float(img.height))
+            nw = max(1, int(img.width * r + 0.5))
+            nh = max(1, int(img.height * r + 0.5))
+            im2 = img.resize((nw, nh), PILImage.LANCZOS)
+            l, t = (nw - cw) // 2, (nh - ch) // 2
+            im2 = im2.crop((l, t, l + cw, t + ch))
+            out = PILImage.alpha_composite(out, im2)
+            continue
+        th = max(2, int(ch * L["size"] / 100.0))
+        r = th / float(img.height)
+        tw = max(2, int(img.width * r))
+        im2 = img.resize((tw, th), PILImage.LANCZOS)
+        if abs(L["rot"]) > 0.01:
+            im2 = im2.rotate(L["rot"], expand=True, resample=PILImage.BICUBIC)
+        tmp = PILImage.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        px = int(cw * L["x"] / 100.0 - im2.width / 2.0)
+        py = int(ch * L["y"] / 100.0 - im2.height / 2.0)
+        tmp.paste(im2, (px, py))
+        out = PILImage.alpha_composite(out, tmp)
+    return out
 
 
 # ---------------- फ़ाइल सेव ----------------
@@ -725,7 +752,7 @@ class Preview(BoxLayout):
     def __init__(self, **kw):
         super().__init__(**kw)
         with self.canvas.before:
-            Color(0.85, 0.85, 0.85, 1)
+            Color(0.15, 0.15, 0.15, 1)
             self.rect = Rectangle(pos=self.pos, size=self.size)
         self.bind(pos=self._upd, size=self._upd)
 
@@ -738,141 +765,130 @@ def mk_label(hi, en, h=30):
     return Label(text=bi(hi, en), markup=True, size_hint_y=None, height=dp(h))
 
 
+# ---- लेयर पर चलने वाले काम (thread में) ----
+def op_extract(im):
+    cut, src, note = extract_person(im)
+    return cut, src, note
+
+
+def op_cut(im):
+    cut = remove_background(im)
+    return cut, align_src(im, cut), ""
+
+
+def op_plain(im, tol):
+    return remove_plain_bg(im, tol), im.convert("RGBA"), ""
+
+
+def op_hd(im):
+    hd, src = hd_upscale(im)
+    return hd, None, "[" + src + "]"
+
+
 class DesignApp(App):
-    base = None
-    person = None
-    person_src = None
-    bg = None
-    final = None
-    history = []
-    last_uri = None
-    last_mime = "application/pdf"
-    camera_uri = None
-    photo_loaded = False
-    # मल्टीपल लेयर सपोर्ट
-    layers = []  # [{"img": PILImage, "name": str}]
 
     def build(self):
-        self.title = "AI Design Studio - Pro"
+        self.title = "AI Design Studio"
+        self.layers = []
+        self.sel = None
+        self._syncing = False
+        self._pv_ev = None
+        self.camera_uri = None
+        self.last_uri = None
+        self.last_mime = "application/pdf"
         self.action_btns = []
+        self.lsliders = {}
+
         scroll = ScrollView()
         root = BoxLayout(orientation="vertical", size_hint_y=None,
                          padding=dp(10), spacing=dp(8))
         root.bind(minimum_height=root.setter("height"))
         scroll.add_widget(root)
 
-        # ===== 1) फोटो चुनें (मल्टीपल सपोर्ट) =====
-        root.add_widget(mk_label("1) फ़ोटो चुनें (एक से ज़्यादा)",
-                                 "1) Choose photo (multiple)", 32))
-        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
-        for hi, en, cb in [("गैलरी", "Gallery", self.pick_gallery),
-                           ("कैमरा", "Camera", self.pick_camera)]:
-            b = Button(text=bi(hi, en, sep="\n"), markup=True, halign="center")
-            b.bind(on_press=cb)
-            row.add_widget(b)
-            self.action_btns.append(b)
-        root.add_widget(row)
+        # ===== 1) फ़ोटो =====
+        root.add_widget(mk_label("1) फ़ोटो चुनें (कई एक साथ)",
+                                 "1) Choose photos (many)", 32))
+        self._row(root, [("गैलरी (कई)", "Gallery (multi)", self.pick_gallery, None),
+                         ("कैमरा", "Camera", self.pick_camera, None)])
 
-        # लेयर लिस्ट
-        self.layer_label = Label(text=bi("कोई लेयर नहीं", "No layers"),
-                                 markup=True, size_hint_y=None, height=dp(28))
-        root.add_widget(self.layer_label)
-
-        clear_btn = Button(text=bi("सभी लेयर हटाएँ", "Clear all layers", sep="\n"),
-                           markup=True, halign="center", size_hint_y=None,
-                           height=dp(44), background_color=(0.8, 0.2, 0.2, 1))
-        clear_btn.bind(on_press=self.clear_layers)
-        root.add_widget(clear_btn)
-
-        pv = Preview(size_hint_y=None, height=dp(320), padding=dp(2))
-        self.preview = Image()
+        pv = Preview(size_hint_y=None, height=dp(360), padding=dp(2))
+        self.preview = Image(nocache=True)
         pv.add_widget(self.preview)
         root.add_widget(pv)
 
-        # ===== 2) कटिंग =====
-        root.add_widget(mk_label("2) कटिंग और करेक्शन", "2) Cutting & correction", 34))
+        # ===== 2) कैनवास =====
+        root.add_widget(mk_label("2) कैनवास", "2) Canvas", 30))
+        crow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        self.canvas_sp = Spinner(text="Portrait 2:3",
+                                 values=list(CANVAS_META.keys()))
+        self.canvas_sp.bind(text=lambda *a: self.schedule_preview())
+        self.cbg_sp = Spinner(text="Transparent", values=list(BG_COLORS.keys()))
+        self.cbg_sp.bind(text=lambda *a: self.schedule_preview())
+        crow.add_widget(self.canvas_sp)
+        crow.add_widget(self.cbg_sp)
+        root.add_widget(crow)
+
+        # ===== 3) लेयर =====
+        root.add_widget(mk_label("3) लेयर चुनें और सेट करें",
+                                 "3) Select & arrange layer", 32))
+        self.layer_sp = Spinner(text="No layers", values=[],
+                                size_hint_y=None, height=dp(48))
+        self.layer_sp.bind(text=self._on_layer_pick)
+        root.add_widget(self.layer_sp)
+        self._row(root, [("ऊपर", "Up", self.on_up, None),
+                         ("नीचे", "Down", self.on_down, None),
+                         ("छिपाएँ/दिखाएँ", "Hide/Show", self.on_vis, None),
+                         ("हटाएँ", "Delete", self.on_delete, (0.8, 0.2, 0.2, 1))],
+                  track=False, h=52)
+        self._row(root, [("फ़िट करें", "Fit", self.on_fit, None),
+                         ("बैकग्राउंड बनाएँ", "Use as BG (fill)", self.on_fill, None)],
+                  track=False, h=52)
+        self._lslider(root, "आकार", "Size", 5, 140, 60, "size")
+        self._lslider(root, "बाएँ-दाएँ", "Left-Right", -10, 110, 50, "x")
+        self._lslider(root, "ऊपर-नीचे", "Up-Down", -10, 110, 50, "y")
+        self._lslider(root, "घुमाव", "Rotate", -180, 180, 0, "rot")
+
+        # ===== 4) कटिंग =====
+        root.add_widget(mk_label("4) चुनी लेयर की कटिंग / HD",
+                                 "4) Cut / HD (selected layer)", 32))
         self._row(root, [
             ("व्यक्ति अलग करें", "Extract Person", self.on_extract, (0.9, 0.5, 0.1, 1)),
-            ("बैकग्राउंड काटें (AI)", "Cut Background (AI)", self.on_cut, (0.7, 0.4, 0.1, 1))])
+            ("बैकग्राउंड काटें (AI)", "Cut BG (AI)", self.on_cut, (0.7, 0.4, 0.1, 1))])
         self.tol_sl = self._slider(root, "सहनशीलता", "Tolerance", 5, 120, 40)
         self._row(root, [
             ("सादा बैकग्राउंड हटाएँ", "Remove Plain BG", self.on_plain, (0.6, 0.3, 0.6, 1)),
             ("करेक्शन करें", "Edit / Correct", self.open_editor, (0.1, 0.6, 0.5, 1))])
+        self._row(root, [("HD बनाएँ", "Make HD", self.on_hd, (0.2, 0.6, 1, 1)),
+                         ("इस लेयर का Undo", "Layer Undo", self.on_layer_undo, None)],
+                  track=False)
+
+        # ===== 5) AI =====
+        root.add_widget(mk_label("5) AI डिज़ाइन", "5) AI design", 32))
+        root.add_widget(Label(text=bi("पीछे का डिज़ाइन कैसा हो (English/Hinglish)",
+                                      "Describe the background design"),
+                              markup=True, size_hint_y=None, height=dp(26)))
+        self.bg_prompt = TextInput(
+            hint_text="e.g. purple gold luxury poster background",
+            multiline=True, size_hint_y=None, height=dp(64))
+        root.add_widget(self.bg_prompt)
         self._row(root, [
-            ("HD बनाएँ", "Make HD", self.on_hd, (0.2, 0.6, 1, 1)),
-            ("पिछला वापस", "Undo", self.on_undo, None)], track=False)
-
-        # कटे हुए भाग को लेयर में जोड़ें
-        add_layer_btn = Button(
-            text=bi("कटे भाग को लेयर में जोड़ें", "Add cut to layers", sep="\n"),
-            markup=True, halign="center", size_hint_y=None, height=dp(48),
-            background_color=(0.5, 0.3, 0.9, 1))
-        add_layer_btn.bind(on_press=self.add_current_to_layers)
-        root.add_widget(add_layer_btn)
-        self.action_btns.append(add_layer_btn)
-
-        # ===== 3) AI एडिट =====
-        root.add_widget(mk_label("3) AI से बदलाव करें",
-                                 "3) AI Edit (object / background / full)", 34))
-
-        root.add_widget(Label(text=bi("क्या बदलना है? (Object/Background)",
-                                       "What to change? (Object/Background)"),
-                              markup=True, size_hint_y=None, height=dp(28)))
-
-        self.color_prompt = TextInput(
-            hint_text="e.g. change shirt color to red  /  make background blue with stars",
-            multiline=True, size_hint_y=None, height=dp(70))
-        root.add_widget(self.color_prompt)
-
-        r_ai = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(6))
-        for hi, en, mode, col in [
-            ("ऑब्जेक्ट का रंग", "Object Color", "object", (0.9, 0.4, 0.1, 1)),
-            ("बैकग्राउंड बदलें", "Background", "background", (0.1, 0.4, 0.8, 1)),
-            ("पूरा एडिट", "Full Edit", "full", (0.5, 0.2, 0.7, 1))]:
-            b = Button(text=bi(hi, en, sep="\n"), markup=True, halign="center",
-                       background_color=col)
-            b.bind(on_press=lambda inst, m=mode: self.on_ai_edit_mode(m))
-            r_ai.add_widget(b)
-            self.action_btns.append(b)
-        root.add_widget(r_ai)
-
-        # कटे हुए भाग पर नया डिज़ाइन
-        self.cut_design_input = TextInput(
-            hint_text="कटे भाग पर नया डिज़ाइन (e.g. golden texture)",
-            multiline=False, size_hint_y=None, height=dp(50))
-        root.add_widget(self.cut_design_input)
-        cut_design_btn = Button(
-            text=bi("कटे भाग पर नया डिज़ाइन बनाएं",
-                    "New design on cut part", sep="\n"),
-            markup=True, halign="center", size_hint_y=None, height=dp(52),
-            background_color=(0.9, 0.6, 0.2, 1))
-        cut_design_btn.bind(on_press=self.on_cut_design)
-        root.add_widget(cut_design_btn)
-        self.action_btns.append(cut_design_btn)
-
-        # ===== 4) डिज़ाइन बनाएं =====
-        root.add_widget(mk_label("4) नया डिज़ाइन", "4) New design", 34))
-        self.prompt_input = TextInput(
-            hint_text="e.g. purple gold luxury achiever poster background",
-            multiline=True, size_hint_y=None, height=dp(70))
-        root.add_widget(self.prompt_input)
-        auto = Button(
-            text=bi("AUTO: व्यक्ति + HD + डिज़ाइन", "AUTO: Person + HD + Design", sep="\n"),
-            markup=True, halign="center", size_hint_y=None, height=dp(60),
-            background_color=(0.1, 0.7, 0.3, 1))
-        auto.bind(on_press=self.on_auto)
-        root.add_widget(auto)
-        self.action_btns.append(auto)
+            ("AI बैकग्राउंड बनाएँ", "AI Background", self.on_ai_bg, (0.2, 0.4, 0.9, 1)),
+            ("AUTO: अलग+HD+बैकग्राउंड", "AUTO: Cut+HD+BG", self.on_auto, (0.1, 0.7, 0.3, 1))],
+            h=60)
+        root.add_widget(Label(text=bi("चुनी लेयर में क्या बदलना है",
+                                      "What to change in selected layer"),
+                              markup=True, size_hint_y=None, height=dp(26)))
+        self.edit_prompt = TextInput(
+            hint_text="e.g. change shirt color to red  /  golden texture",
+            multiline=True, size_hint_y=None, height=dp(64))
+        root.add_widget(self.edit_prompt)
         self._row(root, [
-            ("नया डिज़ाइन", "New Design", self.on_design, (0.2, 0.4, 0.9, 1)),
-            ("AI से फ़ोटो बदलें", "AI Edit photo", self.on_ai_edit, None)])
-        self.p_size = self._slider(root, "व्यक्ति आकार", "Person size", 30, 95, 74)
-        self.p_x = self._slider(root, "व्यक्ति बाएँ-दाएँ", "Person L-R", 0, 100, 50)
-        self.p_y = self._slider(root, "व्यक्ति ऊपर-नीचे", "Person U-D", 0, 100, 60)
+            ("ऑब्जेक्ट/रंग बदलें", "Change Object/Color", self.on_ai_object, (0.9, 0.4, 0.1, 1)),
+            ("पूरा AI एडिट", "Full AI Edit", self.on_ai_full, (0.5, 0.2, 0.7, 1))], h=60)
 
-        # ===== 5) टेक्स्ट =====
-        root.add_widget(mk_label("5) टेक्स्ट लिखें (Rotate/Curve)",
-                                 "5) Add text (Rotate/Curve)", 34))
+        # ===== 6) टेक्स्ट =====
+        root.add_widget(mk_label("6) टेक्स्ट (नई लेयर बनती है)",
+                                 "6) Text (becomes a layer)", 32))
         self.hi_input = TextInput(
             hint_text=("यहाँ हिंदी में लिखें" if HAS_FONT else "Hindi text"),
             font_name=(FONT_PATH if HAS_FONT else "Roboto"),
@@ -882,40 +898,32 @@ class DesignApp(App):
             hint_text="Write English text here", multiline=True,
             size_hint_y=None, height=dp(60))
         root.add_widget(self.en_input)
-        self.color_sp = Spinner(text="White", values=list(COLORS.keys()),
-                                size_hint_y=None, height=dp(44))
-        root.add_widget(self.color_sp)
+        trow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        self.color_sp = Spinner(text="White", values=list(COLORS.keys()))
         self.outline_sp = Spinner(
             text="Black outline",
-            values=["No outline", "Black outline", "White outline"],
-            size_hint_y=None, height=dp(44))
-        root.add_widget(self.outline_sp)
-        self.size_sl = self._slider(root, "आकार", "Size", 3, 40, 6)
-        self.x_sl = self._slider(root, "बाएँ-दाएँ", "Left-Right", 0, 100, 50)
-        self.y_sl = self._slider(root, "ऊपर-नीचे", "Up-Down", 0, 100, 90)
-        self.angle_sl = self._slider(root, "घुमाव (Tilt)", "Rotation", -180, 180, 0)
-        self._row(root, [("टेक्स्ट जोड़ें", "Add Text", self.on_add_text, None),
-                         ("टेक्स्ट हटाएँ", "Remove Text", self.on_remove_text, None)],
-                  track=False)
+            values=["No outline", "Black outline", "White outline"])
+        trow.add_widget(self.color_sp)
+        trow.add_widget(self.outline_sp)
+        root.add_widget(trow)
+        self.tsize_sl = self._slider(root, "टेक्स्ट आकार", "Text size", 3, 30, 9)
+        self._row(root, [("टेक्स्ट जोड़ें", "Add Text", self.on_add_text,
+                          (0.1, 0.6, 0.5, 1))], track=False)
 
-        # ===== 6) सेव =====
-        root.add_widget(mk_label("6) सेव / भेजें", "6) Save / Send", 34))
-        r4 = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
-        for hi, en, kind in [("PNG सेव (शर्ट प्रिंट)", "Save PNG", "png"),
-                             ("PDF सेव", "Save PDF", "pdf")]:
-            b = Button(text=bi(hi, en, sep="\n"), markup=True, halign="center")
-            b.bind(on_press=lambda inst, k=kind: self.export(k))
-            r4.add_widget(b)
-            self.action_btns.append(b)
-        root.add_widget(r4)
-        sb = Button(text=bi("पिछली फ़ाइल शेयर करें", "Share last file", sep="\n"),
-                    markup=True, halign="center", size_hint_y=None,
-                    height=dp(52), background_color=(0.2, 0.7, 0.3, 1))
-        sb.bind(on_press=self.share_last)
-        root.add_widget(sb)
+        # ===== 7) सेव =====
+        root.add_widget(mk_label("7) सेव / भेजें", "7) Save / Send", 32))
+        self._row(root, [("PNG सेव (शर्ट प्रिंट)", "Save PNG",
+                          lambda *_: self.export("png"), None),
+                         ("PDF सेव", "Save PDF",
+                          lambda *_: self.export("pdf"), None)], h=56)
+        self._row(root, [("वेक्टर PDF (शार्प)", "Vector PDF",
+                          lambda *_: self.export("vector"), None)], h=52)
+        self._row(root, [("पिछली फ़ाइल शेयर करें", "Share last file",
+                          self.share_last, (0.2, 0.7, 0.3, 1))],
+                  track=False, h=52)
 
         self.status = Label(text=bi("तैयार", "Ready"), markup=True,
-                            size_hint_y=None, height=dp(60))
+                            size_hint_y=None, height=dp(70))
         self.status.bind(size=lambda w, s: setattr(w, "text_size", s))
         root.add_widget(self.status)
 
@@ -925,10 +933,12 @@ class DesignApp(App):
                 activity.bind(on_activity_result=self._on_result)
             except Exception:
                 pass
+        Clock.schedule_once(lambda dt: self.refresh_preview(), 0.3)
         return scroll
 
-    def _row(self, root, items, track=True):
-        row = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
+    # ---------- UI helpers ----------
+    def _row(self, root, items, track=True, h=56):
+        row = BoxLayout(size_hint_y=None, height=dp(h), spacing=dp(6))
         for hi, en, cb, col in items:
             b = Button(text=bi(hi, en, sep="\n"), markup=True, halign="center")
             if col:
@@ -942,13 +952,17 @@ class DesignApp(App):
     def _slider(self, root, hi, en, mn, mx, val):
         row = BoxLayout(size_hint_y=None, height=dp(40))
         row.add_widget(Label(text=bi(hi, en), markup=True,
-                             size_hint_x=None, width=dp(150)))
+                             size_hint_x=None, width=dp(140)))
         sl = Slider(min=mn, max=mx, value=val)
         row.add_widget(sl)
         root.add_widget(row)
         return sl
 
-    # ---------- helpers ----------
+    def _lslider(self, root, hi, en, mn, mx, val, key):
+        sl = self._slider(root, hi, en, mn, mx, val)
+        sl.bind(value=lambda inst, v, k=key: self._on_layer_slider(k, v))
+        self.lsliders[key] = sl
+
     def popup(self, msg):
         c = Label(text=msg, markup=True, halign="center")
         c.bind(size=lambda w, s: setattr(w, "text_size", s))
@@ -974,56 +988,142 @@ class DesignApp(App):
         msg = bi("त्रुटि", "Error", sep=": ") + "\n" + escape_markup(str(e))[:300]
         self.ui(lambda: (self.popup(msg), self.done(bi("फेल", "Failed"))))
 
-    def refresh_preview(self):
-        img = self.final if self.final is not None else self.base
-        if img is None:
-            return
-        path = os.path.join(self.user_data_dir, "preview.png")
-        p = img.copy()
-        p.thumbnail((1200, 1200))
-        p.save(path, "PNG")
-        self.preview.source = path
-        self.preview.reload()
+    # ---------- कैनवास / preview ----------
+    def canvas_wh(self):
+        return CANVAS_META[self.canvas_sp.text][0]
 
-    def set_base(self, img, push=True):
-        if push and self.base is not None:
-            self.history.append(self.base)
-            self.history = self.history[-4:]
-        self.base = img
-        self.final = None
+    def bg_rgba(self):
+        return BG_COLORS[self.cbg_sp.text]
+
+    def schedule_preview(self, *a):
+        if self._pv_ev is not None:
+            self._pv_ev.cancel()
+        self._pv_ev = Clock.schedule_once(lambda dt: self.refresh_preview(), 0.12)
+
+    def refresh_preview(self):
+        try:
+            W, H = self.canvas_wh()
+            s = 900.0 / max(W, H)
+            out = render_canvas(self.layers, (W, H), self.bg_rgba(), s, True)
+            shown = PILImage.alpha_composite(checker(out.size), out)
+            path = os.path.join(self.user_data_dir, "preview.png")
+            shown.convert("RGB").save(path, "PNG")
+            self.preview.source = path
+            self.preview.reload()
+        except Exception as e:
+            self.status.text = "Preview error: " + escape_markup(str(e))[:120]
+
+    # ---------- लेयर मैनेजमेंट ----------
+    def index_of(self, L):
+        for i, x in enumerate(self.layers):
+            if x is L:
+                return i
+        return -1
+
+    def update_layers_ui(self, select=None):
+        self._syncing = True
+        self.layer_sp.values = ["%d: %s" % (i + 1, L["name"])
+                                for i, L in enumerate(self.layers)]
+        self._syncing = False
+        if select is None and self.layers:
+            select = self.sel if self.index_of(self.sel) >= 0 else self.layers[-1]
+        self._set_sel(select)
         self.refresh_preview()
 
-    def _set_person_base(self, person, base, src=None, clear_bg=True):
-        self.person = person
-        if src is not None:
-            self.person_src = src
-        if clear_bg:
-            self.bg = None
-        self.photo_loaded = False
-        self.set_base(base)
-
-    def _need_base(self):
-        if self.base is None:
-            self.popup(bi("पहले फ़ोटो चुनें", "Choose a photo first"))
-            return False
-        return True
-
-    def _prompt(self):
-        p = self.prompt_input.text.strip()
-        if not p:
-            self.popup(bi("पहले डिज़ाइन का विवरण लिखें",
-                          "Write the design description first"))
-        return p
-
-    def _update_layer_label(self):
-        n = len(self.layers)
-        if n == 0:
-            txt = bi("कोई लेयर नहीं", "No layers")
+    def _set_sel(self, L):
+        self.sel = L
+        self._syncing = True
+        if L is None or self.index_of(L) < 0:
+            self.sel = None
+            self.layer_sp.text = "No layers"
         else:
-            txt = bi(f"{n} लेयर", f"{n} layers")
-        self.ui(lambda: setattr(self.layer_label, "text", txt))
+            self.layer_sp.text = "%d: %s" % (self.index_of(L) + 1, L["name"])
+            for key, sl in self.lsliders.items():
+                sl.value = L[key]
+        self._syncing = False
 
-    # ---------- फ़ोटो चुनना (मल्टीपल) ----------
+    def _on_layer_pick(self, inst, text):
+        if self._syncing:
+            return
+        try:
+            i = int(text.split(":")[0]) - 1
+            if 0 <= i < len(self.layers):
+                self._set_sel(self.layers[i])
+        except Exception:
+            pass
+
+    def _on_layer_slider(self, key, v):
+        if self._syncing or self.sel is None:
+            return
+        self.sel[key] = float(v)
+        self.schedule_preview()
+
+    def add_layer(self, L, bottom=False):
+        if bottom:
+            self.layers.insert(0, L)
+        else:
+            self.layers.append(L)
+        self.update_layers_ui(select=L)
+
+    def need_sel(self):
+        if self.sel is None:
+            self.popup(bi("पहले फ़ोटो चुनें और लेयर सेलेक्ट करें",
+                          "Choose photos and select a layer first"))
+            return None
+        return self.sel
+
+    def on_up(self, *a):
+        L = self.sel
+        i = self.index_of(L) if L else -1
+        if 0 <= i < len(self.layers) - 1:
+            self.layers[i], self.layers[i + 1] = self.layers[i + 1], self.layers[i]
+            self.update_layers_ui(select=L)
+
+    def on_down(self, *a):
+        L = self.sel
+        i = self.index_of(L) if L else -1
+        if i > 0:
+            self.layers[i], self.layers[i - 1] = self.layers[i - 1], self.layers[i]
+            self.update_layers_ui(select=L)
+
+    def on_vis(self, *a):
+        L = self.sel
+        if L:
+            L["visible"] = not L["visible"]
+            self.refresh_preview()
+
+    def on_delete(self, *a):
+        L = self.sel
+        i = self.index_of(L) if L else -1
+        if i >= 0:
+            self.layers.pop(i)
+            self.sel = None
+            self.update_layers_ui(select=None)
+
+    def on_fit(self, *a):
+        L = self.need_sel()
+        if L is None:
+            return
+        L["size"] = fit_pct(L["img"], self.canvas_wh())
+        L["x"], L["y"], L["rot"] = 50.0, 50.0, 0.0
+        self._set_sel(L)
+        self.refresh_preview()
+
+    def on_fill(self, *a):
+        L = self.need_sel()
+        if L is None:
+            return
+        if L["fill"]:
+            L["fill"] = False
+        else:
+            for x in self.layers:
+                x["fill"] = False
+            L["fill"] = True
+            self.layers.pop(self.index_of(L))
+            self.layers.insert(0, L)
+        self.update_layers_ui(select=L)
+
+    # ---------- फ़ोटो चुनना (कई) ----------
     def pick_gallery(self, *a):
         if platform != "android":
             self.popup("Android only")
@@ -1038,7 +1138,7 @@ class DesignApp(App):
             intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
             intent.addCategory(Intent.CATEGORY_OPENABLE)
             chooser = Intent.createChooser(
-                intent, cast("java.lang.CharSequence", String("Select photo(s)")))
+                intent, cast("java.lang.CharSequence", String("Select photos")))
             PA.mActivity.startActivityForResult(chooser, REQ_GALLERY)
         except Exception as e:
             self.popup("Gallery error: " + escape_markup(str(e)))
@@ -1073,321 +1173,232 @@ class DesignApp(App):
         if request_code not in (REQ_GALLERY, REQ_CAMERA) or result_code != -1:
             return
         uris = []
-        if request_code == REQ_GALLERY and intent is not None:
-            # मल्टीपल सिलेक्शन
-            clip = intent.getClipData()
-            if clip is not None:
-                for i in range(clip.getItemCount()):
-                    uris.append(clip.getItemAt(i).getUri())
-            else:
-                u = intent.getData()
-                if u is not None:
-                    uris.append(u)
-        elif request_code == REQ_CAMERA:
-            if self.camera_uri is not None:
+        try:
+            if request_code == REQ_GALLERY and intent is not None:
+                clip = intent.getClipData()
+                if clip is not None:
+                    for i in range(clip.getItemCount()):
+                        uris.append(clip.getItemAt(i).getUri())
+                else:
+                    u = intent.getData()
+                    if u is not None:
+                        uris.append(u)
+            elif request_code == REQ_CAMERA and self.camera_uri is not None:
                 uris.append(self.camera_uri)
-        for uri in uris:
-            Clock.schedule_once(lambda dt, u=uri: self._load_uri(u))
+        except Exception:
+            pass
+        if uris:
+            Clock.schedule_once(lambda dt: self._load_uris(uris[:8]))
 
-    def _load_uri(self, uri):
-        try:
-            img = load_pil(read_uri_bytes(uri))
-            self.layers.append({"img": img, "name": "layer_%d" % int(time.time())})
-            self._update_layer_label()
-            # पहली बार लोड होने पर base भी सेट करें
-            if self.base is None:
-                self.set_base(img, push=False)
-                self.photo_loaded = True
-            self.done(bi(f"लोड हो गई ({len(self.layers)} लेयर)",
-                         f"Loaded ({len(self.layers)} layers)"))
-        except Exception as e:
-            self.popup("Load error: " + escape_markup(str(e)))
-
-    def clear_layers(self, *a):
-        self.layers = []
-        self._update_layer_label()
-        self.done(bi("सभी लेयर हटा दी", "All layers cleared"))
-
-    # ---------- AUTO ----------
-    def on_auto(self, *a):
-        if not self._need_base():
+    def _load_uris(self, uris):
+        blobs = []
+        for u in uris:
+            try:
+                blobs.append(read_uri_bytes(u))
+            except Exception as e:
+                self.popup("Read error: " + escape_markup(str(e)))
+        if not blobs:
             return
-        prompt = self._prompt()
-        if not prompt:
-            return
-        self.busy(bi("AUTO चल रहा है...", "AUTO running..."))
-        threading.Thread(
-            target=self._auto_worker,
-            args=(prompt, self.base, self.p_size.value, self.p_x.value,
-                  self.p_y.value), daemon=True).start()
-
-    def _auto_worker(self, prompt, img, size, x, y):
-        try:
-            self.say(bi("1/3 व्यक्ति अलग कर रहा है...", "1/3 Extracting person..."))
-            cut, src, note = extract_person(img)
-            self.ui(lambda: self._set_person_base(cut, cut, src=src))
-            self.say(bi("2/3 HD बना रहा है...", "2/3 Making HD..."))
-            hd, hsrc = hd_upscale(cut)
-            self.ui(lambda: self._set_person_base(hd, hd))
-            self.say(bi("3/3 नया डिज़ाइन बना रहा है...", "3/3 Creating design..."))
-            bg = generate_image(
-                prompt + ". Poster background design only, vibrant, professional, "
-                "no people, no text, empty space in the center.")
-            out = compose_design(bg, hd, size, x, y)
-            self.ui(lambda: setattr(self, "bg", bg))
-            self.ui(lambda: self._set_person_base(hd, out, clear_bg=False))
-            msg = bi("पूरा हुआ!", "All done!") + "  [HD: " + escape_markup(hsrc) + "]"
-            if note:
-                msg += "\n" + escape_markup(note)
-            self.ui(lambda: self.done(msg))
-        except Exception as e:
-            self.fail(e)
-
-    # ---------- कटिंग ----------
-    def on_extract(self, *a):
-        if not self._need_base():
-            return
-        self.busy(bi("व्यक्ति अलग कर रहा है...", "Extracting person..."))
-        threading.Thread(target=self._extract_worker, args=(self.base,),
+        self.busy(bi("फ़ोटो लोड हो रही हैं...", "Loading photos..."))
+        threading.Thread(target=self._decode_worker, args=(blobs,),
                          daemon=True).start()
 
-    def _extract_worker(self, img):
+    def _decode_worker(self, blobs):
         try:
-            cut, src, note = extract_person(img)
-            self.ui(lambda: self._set_person_base(cut, cut, src=src))
-            msg = bi("व्यक्ति अलग हो गया", "Person extracted")
-            if note:
-                msg += "\n" + escape_markup(note)
-            self.ui(lambda: self.done(msg))
+            imgs = [load_pil(b) for b in blobs]
+            self.ui(lambda: self._add_images(imgs))
         except Exception as e:
             self.fail(e)
+
+    def _add_images(self, imgs):
+        spots = [(50, 50), (30, 32), (70, 68), (30, 70), (70, 30), (50, 50)]
+        wh = self.canvas_wh()
+        last = None
+        for img in imgs:
+            n = len(self.layers)
+            fit = fit_pct(img, wh)
+            first = (n == 0)
+            sx, sy = spots[n % len(spots)] if not first else (50, 50)
+            L = new_layer(img, "Photo %d" % (n + 1),
+                          size=(fit if first else fit * 0.5), x=sx, y=sy)
+            self.layers.append(L)
+            last = L
+        self.update_layers_ui(select=last)
+        self.done(bi("%d फ़ोटो जुड़ गईं (कुल %d लेयर)" % (len(imgs), len(self.layers)),
+                     "%d photo(s) added (%d layers)" % (len(imgs), len(self.layers))))
+
+    # ---------- चुनी लेयर पर काम ----------
+    def run_layer_op(self, hi, en, fn, ok_hi, ok_en):
+        L = self.need_sel()
+        if L is None:
+            return
+        self.busy(bi(hi, en))
+        img = L["img"]
+
+        def work():
+            try:
+                res = fn(img)
+                self.ui(lambda: self._apply_result(L, res, ok_hi, ok_en))
+            except Exception as e:
+                self.fail(e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _push_hist(self, L):
+        L["hist"].append(L["img"])
+        L["hist"] = L["hist"][-3:]
+
+    def _apply_result(self, L, res, ok_hi, ok_en):
+        new_img, new_src, note = res
+        self._push_hist(L)
+        L["img"] = new_img
+        if new_src is not None:
+            L["src"] = new_src
+        L["prev"] = None
+        self.refresh_preview()
+        msg = bi(ok_hi, ok_en)
+        if note:
+            msg += "\n" + escape_markup(str(note))
+        self.done(msg)
+
+    def on_extract(self, *a):
+        self.run_layer_op("व्यक्ति अलग कर रहा है...", "Extracting person...",
+                          op_extract, "व्यक्ति अलग हो गया", "Person extracted")
 
     def on_cut(self, *a):
-        if not self._need_base():
-            return
-        self.busy(bi("बैकग्राउंड हटा रहा है...", "Removing background..."))
-        threading.Thread(target=self._cut_worker, args=(self.base,),
-                         daemon=True).start()
-
-    def _cut_worker(self, img):
-        try:
-            cut = remove_background(img)
-            src = align_src(img, cut)
-            self.ui(lambda: self._set_person_base(cut, cut, src=src))
-            self.ui(lambda: self.done(bi("कटिंग हो गई!", "Cut done!")))
-        except Exception as e:
-            self.fail(e)
+        self.run_layer_op("बैकग्राउंड हटा रहा है...", "Removing background...",
+                          op_cut, "कटिंग हो गई!", "Cut done!")
 
     def on_plain(self, *a):
-        if not self._need_base():
-            return
-        self.busy(bi("सादा बैकग्राउंड हटा रहा है...", "Removing plain background..."))
-        threading.Thread(target=self._plain_worker,
-                         args=(self.base, int(self.tol_sl.value)),
-                         daemon=True).start()
+        tol = int(self.tol_sl.value)
+        self.run_layer_op("सादा बैकग्राउंड हटा रहा है...", "Removing plain BG...",
+                          lambda im, t=tol: op_plain(im, t),
+                          "हो गया. बचा हिस्सा 'करेक्शन करें' से ठीक करें",
+                          "Done. Fix leftovers with Edit / Correct")
 
-    def _plain_worker(self, img, tol):
-        try:
-            out = remove_plain_bg(img, tol)
-            src = img.convert("RGBA")
-            self.ui(lambda: self._set_person_base(out, out, src=src))
-            self.ui(lambda: self.done(bi(
-                "हो गया. बचा हुआ हिस्सा 'करेक्शन करें' से ठीक करें",
-                "Done. Fix leftovers with 'Edit / Correct'")))
-        except Exception as e:
-            self.fail(e)
-
-    def add_current_to_layers(self, *a):
-        target = self.person if self.person is not None else self.base
-        if target is None:
-            self.popup(bi("पहले कुछ काटें", "First cut something"))
-            return
-        self.layers.append({"img": target.copy(), "name": "layer_%d" % int(time.time())})
-        self._update_layer_label()
-        self.done(bi(f"लेयर में जोड़ दिया ({len(self.layers)})",
-                     f"Added to layers ({len(self.layers)})"))
-
-    # ---------- AI एडिट मोड ----------
-    def on_ai_edit_mode(self, mode):
-        prompt = self.color_prompt.text.strip()
-        if not prompt:
-            self.popup(bi("क्या बदलना है वो लिखें", "Write what to change"))
-            return
-
-        if mode == "object":
-            if self.person is None:
-                self.popup(bi("पहले 'व्यक्ति अलग करें' दबाएं",
-                              "First press 'Extract Person'"))
-                return
-            target = self.person
-        elif mode == "background":
-            if self.base is None:
-                self.popup(bi("पहले फ़ोटो या डिज़ाइन चुनें",
-                              "Choose a photo or design first"))
-                return
-            target = self.base
-        else:
-            if self.base is None:
-                self.popup(bi("पहले फ़ोटो चुनें", "Choose a photo first"))
-                return
-            target = self.base
-
-        self.busy(bi(f"AI {mode} एडिट कर रहा है...", f"AI {mode} editing..."))
-        threading.Thread(target=self._ai_edit_worker,
-                         args=(prompt, target, mode), daemon=True).start()
-
-    def _ai_edit_worker(self, prompt, target_img, mode):
-        try:
-            edited = gemini_edit(target_img, prompt, mode=mode,
-                                 reference_img=target_img)
-
-            if mode == "object":
-                orig_alpha = target_img.split()[3]
-                if edited.size != target_img.size:
-                    orig_alpha = orig_alpha.resize(edited.size, PILImage.LANCZOS)
-                edited.putalpha(orig_alpha)
-
-                if self.bg is not None:
-                    out = compose_design(self.bg, edited, self.p_size.value,
-                                         self.p_x.value, self.p_y.value)
-                    self.ui(lambda: self._set_person_base(edited, out, clear_bg=False))
-                else:
-                    self.ui(lambda: self._set_person_base(edited, edited))
-                self.ui(lambda: self.done(bi("ऑब्जेक्ट का रंग बदल गया!",
-                                              "Object color changed!")))
-
-            elif mode == "background":
-                if self.person is not None:
-                    new_bg = edited
-                    out = compose_design(new_bg, self.person, self.p_size.value,
-                                         self.p_x.value, self.p_y.value)
-                    self.ui(lambda: setattr(self, "bg", new_bg))
-                    self.ui(lambda: self._set_person_base(
-                        self.person, out, clear_bg=False))
-                else:
-                    self.ui(lambda: self.set_base(edited))
-                self.ui(lambda: self.done(bi("बैकग्राउंड बदल गया!",
-                                              "Background changed!")))
-
-            else:
-                self.ui(lambda: self.set_base(edited))
-                self.ui(lambda: self.done(bi("पूरा एडिट हो गया!",
-                                              "Full edit done!")))
-        except Exception as e:
-            self.fail(e)
-
-    # ---------- कटे भाग पर नया डिज़ाइन ----------
-    def on_cut_design(self, *a):
-        if self.person is None:
-            self.popup(bi("पहले 'व्यक्ति अलग करें' दबाएं",
-                          "First press 'Extract Person'"))
-            return
-        prompt = self.cut_design_input.text.strip()
-        if not prompt:
-            self.popup(bi("नया डिज़ाइन लिखें", "Write new design description"))
-            return
-        self.busy(bi("कटे भाग पर डिज़ाइन बना रहा है...",
-                     "Designing on cut part..."))
-        threading.Thread(target=self._cut_design_worker,
-                         args=(prompt, self.person), daemon=True).start()
-
-    def _cut_design_worker(self, prompt, cut_img):
-        try:
-            new_cut = design_on_cut(cut_img, prompt)
-            if self.bg is not None:
-                out = compose_design(self.bg, new_cut, self.p_size.value,
-                                     self.p_x.value, self.p_y.value)
-                self.ui(lambda: self._set_person_base(new_cut, out, clear_bg=False))
-            else:
-                self.ui(lambda: self._set_person_base(new_cut, new_cut))
-            self.ui(lambda: self.done(bi("कटे भाग पर डिज़ाइन बन गया!",
-                                          "Design on cut part done!")))
-        except Exception as e:
-            self.fail(e)
-
-    # ---------- HD / डिज़ाइन ----------
     def on_hd(self, *a):
-        if not self._need_base():
+        self.run_layer_op("HD बना रहा है...", "Making HD...",
+                          op_hd, "HD हो गया", "HD done")
+
+    def on_layer_undo(self, *a):
+        L = self.need_sel()
+        if L is None:
             return
-        self.busy(bi("HD बना रहा है...", "Making HD..."))
-        is_person = self.person is not None and self.base is self.person
-        threading.Thread(target=self._hd_worker, args=(self.base, is_person),
-                         daemon=True).start()
-
-    def _hd_worker(self, img, is_person):
-        try:
-            hd, src = hd_upscale(img)
-            if is_person:
-                self.ui(lambda: self._set_person_base(hd, hd))
-            else:
-                self.ui(lambda: self.set_base(hd))
-            self.ui(lambda: self.done(bi("HD हो गया", "HD done")
-                                      + "  [" + escape_markup(src) + "]"))
-        except Exception as e:
-            self.fail(e)
-
-    def on_design(self, *a):
-        prompt = self._prompt()
-        if not prompt:
-            return
-        if self.person is None and self.photo_loaded:
-            self.popup(bi("पहले 'व्यक्ति अलग करें' दबाइए",
-                          "Press 'Extract Person' first"))
-            return
-        self.busy(bi("डिज़ाइन बना रहा है...", "Creating design..."))
-        threading.Thread(
-            target=self._design_worker,
-            args=(prompt, self.person, self.p_size.value, self.p_x.value,
-                  self.p_y.value), daemon=True).start()
-
-    def _design_worker(self, prompt, person, size, x, y):
-        try:
-            if person is not None:
-                bg = generate_image(
-                    prompt + ". Poster background design only, vibrant, "
-                    "professional, no people, no text, empty space in the center.")
-                out = compose_design(bg, person, size, x, y)
-                self.ui(lambda: setattr(self, "bg", bg))
-            else:
-                out = generate_image(prompt + ". High quality, print ready design.")
-            self.ui(lambda: self.set_base(out))
-            self.ui(lambda: self.done(bi("डिज़ाइन तैयार", "Design ready")))
-        except Exception as e:
-            self.fail(e)
-
-    def on_ai_edit(self, *a):
-        if not self._need_base():
-            return
-        prompt = self._prompt()
-        if not prompt:
-            return
-        self.busy(bi("AI बदलाव कर रहा है...", "AI editing..."))
-        threading.Thread(target=self._edit_worker, args=(prompt, self.base),
-                         daemon=True).start()
-
-    def _edit_worker(self, prompt, img):
-        try:
-            out = gemini_edit(img, prompt, mode="full", reference_img=img)
-            self.ui(lambda: self.set_base(out))
-            self.ui(lambda: self.done(bi("हो गया!", "Done!")))
-        except Exception as e:
-            self.fail(e)
-
-    def on_undo(self, *a):
-        if self.history:
-            self.base = self.history.pop()
-            self.final = None
+        if L["hist"]:
+            L["img"] = L["hist"].pop()
+            L["prev"] = None
             self.refresh_preview()
+            self.status.text = bi("वापस हो गया", "Undone")
+
+    def _need_edit_prompt(self):
+        p = self.edit_prompt.text.strip()
+        if not p:
+            self.popup(bi("क्या बदलना है वह लिखें", "Write what to change"))
+        return p
+
+    def on_ai_object(self, *a):
+        if self.need_sel() is None:
+            return
+        p = self._need_edit_prompt()
+        if not p:
+            return
+        self.run_layer_op("AI बदलाव कर रहा है...", "AI changing...",
+                          lambda im, pr=p: (gemini_edit(im, pr, "object"), None, ""),
+                          "बदलाव हो गया!", "Change done!")
+
+    def on_ai_full(self, *a):
+        if self.need_sel() is None:
+            return
+        p = self._need_edit_prompt()
+        if not p:
+            return
+        self.run_layer_op("AI एडिट कर रहा है...", "AI editing...",
+                          lambda im, pr=p: (gemini_edit(im, pr, "full"), None, ""),
+                          "एडिट हो गया!", "Edit done!")
+
+    # ---------- AI बैकग्राउंड / AUTO ----------
+    def _bg_prompt(self):
+        p = self.bg_prompt.text.strip()
+        if not p:
+            self.popup(bi("पहले बैकग्राउंड का विवरण लिखें",
+                          "Write the background description first"))
+        return p
+
+    def _set_fill_layer(self, bg_img):
+        self.layers = [x for x in self.layers if not x["fill"]]
+        F = new_layer(bg_img, "AI Background", fill=True)
+        self.layers.insert(0, F)
+        self.update_layers_ui(select=self.sel)
+
+    def on_ai_bg(self, *a):
+        p = self._bg_prompt()
+        if not p:
+            return
+        meta = CANVAS_META[self.canvas_sp.text]
+        self.busy(bi("बैकग्राउंड बना रहा है...", "Creating background..."))
+        threading.Thread(target=self._bg_worker, args=(p, meta),
+                         daemon=True).start()
+
+    def _bg_worker(self, prompt, meta):
+        try:
+            _, aspect, (w, h) = meta
+            bg = generate_image(prompt + BG_SUFFIX, aspect, w, h)
+            self.ui(lambda: self._set_fill_layer(bg))
+            self.ui(lambda: self.done(bi("बैकग्राउंड तैयार", "Background ready")))
+        except Exception as e:
+            self.fail(e)
+
+    def on_auto(self, *a):
+        L = self.need_sel()
+        if L is None:
+            return
+        p = self._bg_prompt()
+        if not p:
+            return
+        meta = CANVAS_META[self.canvas_sp.text]
+        self.busy(bi("AUTO चल रहा है...", "AUTO running..."))
+        threading.Thread(target=self._auto_worker, args=(L, p, meta),
+                         daemon=True).start()
+
+    def _commit(self, L, img, src):
+        self._push_hist(L)
+        L["img"] = img
+        if src is not None:
+            L["src"] = src
+        L["prev"] = None
+        self.refresh_preview()
+
+    def _auto_worker(self, L, prompt, meta):
+        try:
+            _, aspect, (w, h) = meta
+            self.say(bi("1/3 व्यक्ति अलग कर रहा है...", "1/3 Extracting person..."))
+            cut, src, note = extract_person(L["img"])
+            self.ui(lambda: self._commit(L, cut, src))
+            self.say(bi("2/3 HD बना रहा है...", "2/3 Making HD..."))
+            hd, hsrc = hd_upscale(cut)
+            self.ui(lambda: self._commit(L, hd, None))
+            self.say(bi("3/3 बैकग्राउंड बना रहा है...", "3/3 Creating background..."))
+            bg = generate_image(prompt + BG_SUFFIX, aspect, w, h)
+
+            def finish():
+                L["size"], L["x"], L["y"], L["rot"] = 74.0, 50.0, 60.0, 0.0
+                self._set_fill_layer(bg)
+                self._set_sel(L)
+                self.done(bi("पूरा हुआ!", "All done!")
+                          + "  [HD: " + escape_markup(hsrc) + "]"
+                          + (("\n" + escape_markup(note)) if note else ""))
+
+            self.ui(finish)
+        except Exception as e:
+            self.fail(e)
 
     # ---------- करेक्शन एडिटर ----------
     def open_editor(self, *a):
-        target = self.person if self.person is not None else self.base
-        if target is None:
-            self.popup(bi("पहले फ़ोटो चुनें और काटें", "Choose and cut a photo first"))
+        L = self.need_sel()
+        if L is None:
             return
-        src = None
-        if self.person is not None and self.person_src is not None:
-            src = align_src(self.person_src, target)
+        target = L["img"]
+        src = align_src(L["src"], target) if L["src"] is not None else None
         ed = EditCanvas(target, src)
         view = ModalView(size_hint=(1, 1), auto_dismiss=False)
         box = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
@@ -1428,7 +1439,6 @@ class DesignApp(App):
             ed, "radius", max(2, int(ed.fw * v / 200.0))))
         brow.add_widget(bs)
         box.add_widget(brow)
-
         box.add_widget(ed)
 
         def done_cb(*_):
@@ -1438,7 +1448,11 @@ class DesignApp(App):
                 self.popup("Edit error: " + escape_markup(str(e)))
                 return
             view.dismiss()
-            self._apply_edit(res)
+            self._push_hist(L)
+            L["img"] = res
+            L["prev"] = None
+            self.refresh_preview()
+            self.status.text = bi("करेक्शन लागू हुआ", "Correction applied")
 
         bottom = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
         ub = Button(text=bi("वापस", "Undo", sep="\n"), markup=True, halign="center")
@@ -1455,70 +1469,50 @@ class DesignApp(App):
         view.add_widget(box)
         view.open()
 
-    def _apply_edit(self, edited):
-        try:
-            if self.person is not None:
-                was_person_base = self.base is self.person
-                self.person = edited
-                if was_person_base:
-                    self.set_base(edited)
-                elif self.bg is not None:
-                    self.set_base(compose_design(
-                        self.bg, edited, self.p_size.value,
-                        self.p_x.value, self.p_y.value))
-                else:
-                    self.refresh_preview()
-            else:
-                self.set_base(edited)
-            self.status.text = bi("करेक्शन लागू हुआ", "Correction applied")
-        except Exception as e:
-            self.popup("Apply error: " + escape_markup(str(e)))
-
     # ---------- टेक्स्ट ----------
     def on_add_text(self, *a):
-        if self.base is None:
-            self.popup(bi("पहले फ़ोटो या डिज़ाइन चाहिए", "Need a photo or design first"))
-            return
         text = (self.hi_input.text + "\n" + self.en_input.text).strip()
         if not text:
             self.popup(bi("टेक्स्ट लिखें", "Write some text"))
             return
         try:
-            self.final = apply_text(
-                self.base, text, COLORS[self.color_sp.text], self.outline_sp.text,
-                self.size_sl.value, self.x_sl.value, self.y_sl.value,
-                angle=int(self.angle_sl.value))
-            self.refresh_preview()
-            self.status.text = bi("टेक्स्ट जुड़ गया", "Text added")
+            img = make_text_image(text, COLORS[self.color_sp.text],
+                                  self.outline_sp.text)
+            lines = max(1, len([l for l in text.split("\n") if l.strip()]))
+            size = min(80.0, self.tsize_sl.value * lines)
+            name = "Text: " + text.replace("\n", " ")[:14]
+            L = new_layer(img, name, kind="text", size=size, x=50, y=88)
+            self.add_layer(L)
+            self.status.text = bi("टेक्स्ट लेयर जुड़ गई", "Text layer added")
         except Exception as e:
             self.popup("Text error: " + escape_markup(str(e)))
 
-    def on_remove_text(self, *a):
-        self.final = None
-        self.refresh_preview()
-
     # ---------- एक्सपोर्ट ----------
     def export(self, kind):
-        img = self.final if self.final is not None else self.base
-        if img is None:
-            self.popup(bi("पहले कुछ बनाएँ", "Create something first"))
+        if not self.layers:
+            self.popup(bi("पहले फ़ोटो चुनें", "Choose photos first"))
             return
+        snap = [dict(L) for L in self.layers]
+        wh = self.canvas_wh()
+        bg = self.bg_rgba()
         self.busy(bi("फ़ाइल बना रहा है...", "Preparing file..."))
-        threading.Thread(target=self._export_worker, args=(kind, img.copy()),
+        threading.Thread(target=self._export_worker, args=(kind, snap, wh, bg),
                          daemon=True).start()
 
-    def _export_worker(self, kind, img):
+    def _export_worker(self, kind, snap, wh, bg):
         try:
+            full = render_canvas(snap, wh, bg, 1.0, False)
             stamp = int(time.time())
             if kind == "png":
-                data = to_bytes(enhance_for_print(img), "PNG", dpi=300)
+                data = to_bytes(sharpen(full), "PNG", dpi=300)
                 name, mime = "design_%d.png" % stamp, "image/png"
             elif kind == "pdf":
-                data = make_pdf(enhance_for_print(img))
+                flat = flatten_on(sharpen(full), bg[:3] if bg else (255, 255, 255))
+                data = make_pdf(flat)
                 name, mime = "design_%d.pdf" % stamp, "application/pdf"
             else:
-                data = make_pdf(enhance_for_print(img))
-                name, mime = "design_%d.pdf" % stamp, "application/pdf"
+                data = vectorize_pdf(full)
+                name, mime = "design_vector_%d.pdf" % stamp, "application/pdf"
             self.ui(lambda: self._finish_save(name, data, mime))
         except Exception as e:
             self.fail(e)
