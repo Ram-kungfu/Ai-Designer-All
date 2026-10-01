@@ -34,8 +34,8 @@ DEEPAI_KEY = "89091b06-226d-414a-94c4-347457d9c8c1"
 GEMINI_KEY = "AQ.Ab8RN6JE6Qll-WBJezPVuTr9ntLAhQTbS7yZDef6oetjPaTF_g"
 GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 GEMINI_TEXT_MODEL = "gemini-3.5-flash"
-VECTORIZER_ID = "vktcf6i92nbgp2f"          # वैकल्पिक
-VECTORIZER_SECRET = "tovebgr66k30if7i3a0or1fiml2qr8804k222sfnnd0p3lu395gn"  # वैकल्पिक
+VECTORIZER_ID = "PASTE_VECTORIZER_ID"          # वैकल्पिक
+VECTORIZER_SECRET = "PASTE_VECTORIZER_SECRET"  # वैकल्पिक
 FLIP_TEXT = False   # अगर टेक्स्ट उल्टा दिखे तो True कर दें
 # ==============================================
 
