@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import time
 import base64
 import threading
@@ -9,10 +10,14 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.core.text import Label as CoreLabel
 from kivy.metrics import dp
-from kivy.graphics import Color, Rectangle
+from kivy.graphics import Color, Rectangle, Line
+from kivy.graphics.texture import Texture
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.stencilview import StencilView
+from kivy.uix.modalview import ModalView
 from kivy.uix.button import Button
+from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.label import Label
 from kivy.uix.image import Image
 from kivy.uix.slider import Slider
@@ -20,15 +25,19 @@ from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.uix.popup import Popup
 from kivy.utils import platform, escape_markup
-from PIL import Image as PILImage, ImageOps, ImageFilter
+from PIL import (Image as PILImage, ImageOps, ImageFilter, ImageDraw,
+                 ImageChops)
 
-# ================= यहाँ अपनी keys डालिए =================
+# ================= आपकी keys =================
 REMOVEBG_KEY = "tTqBYQZHyFSMgQW6Mkzf2sSc"
-GEMINI_KEY = "PASTE_GEMINI_KEY"            # फ़ोटो बदलने के लिए (aistudio.google.com)
+DEEPAI_KEY = "89091b06-226d-414a-94c4-347457d9c8c1"
+GEMINI_KEY = "AQ.Ab8RN6JE6Qll-WBJezPVuTr9ntLAhQTbS7yZDef6oetjPaTF_g"
 GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
-VECTORIZER_ID = "PASTE_VECTORIZER_ID"      # वैकल्पिक (vectorizer.ai/api)
-VECTORIZER_SECRET = "PASTE_VECTORIZER_SECRET"
-# =========================================================
+GEMINI_TEXT_MODEL = "gemini-3.5-flash"
+VECTORIZER_ID = "PASTE_VECTORIZER_ID"          # वैकल्पिक
+VECTORIZER_SECRET = "PASTE_VECTORIZER_SECRET"  # वैकल्पिक
+FLIP_TEXT = False   # अगर टेक्स्ट उल्टा दिखे तो True कर दें
+# ==============================================
 
 Window.softinput_mode = "below_target"
 
@@ -43,6 +52,7 @@ COLORS = {
 }
 REQ_GALLERY = 4101
 REQ_CAMERA = 4102
+GEM_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
 
 
 def bi(hi, en, sep=" / "):
@@ -57,20 +67,23 @@ def key_ok(v):
 
 # ---------------- इमेज हेल्पर ----------------
 
-def load_pil(data):
+def load_pil(data, maxside=2048):
     im = PILImage.open(io.BytesIO(data))
     try:
         im = ImageOps.exif_transpose(im)
     except Exception:
         pass
     im = im.convert("RGBA")
-    im.thumbnail((2048, 2048), PILImage.LANCZOS)
+    im.thumbnail((maxside, maxside), PILImage.LANCZOS)
     return im
 
 
-def to_bytes(img, fmt="PNG"):
+def to_bytes(img, fmt="PNG", dpi=None):
     out = io.BytesIO()
-    img.save(out, fmt)
+    if dpi:
+        img.save(out, fmt, dpi=(dpi, dpi))
+    else:
+        img.save(out, fmt)
     return out.getvalue()
 
 
@@ -100,49 +113,115 @@ def make_pdf(img):
     return out.getvalue()
 
 
-# ---------------- AI / API ----------------
+def align_src(src, target):
+    s = src.convert("RGBA")
+    if s.size != target.size:
+        s = s.resize(target.size, PILImage.LANCZOS)
+    return s
 
-def generate_design(prompt):
-    full = prompt + ", isolated on plain white background, sticker design, high detail"
-    url = ("https://image.pollinations.ai/prompt/" + requests.utils.quote(full)
-           + "?width=1024&height=1024&nologo=true")
+
+# ---------------- Gemini ----------------
+
+def gemini_call(model, parts, gen_config=None, timeout=180):
+    if not key_ok(GEMINI_KEY):
+        raise Exception("GEMINI_KEY not set")
+    payload = {"contents": [{"parts": parts}]}
+    if gen_config:
+        payload["generationConfig"] = gen_config
+    r = requests.post(GEM_URL + model + ":generateContent",
+                      headers={"x-goog-api-key": GEMINI_KEY},
+                      json=payload, timeout=timeout)
+    try:
+        data = r.json()
+    except Exception:
+        raise Exception(f"Gemini HTTP {r.status_code}")
+    if r.status_code != 200:
+        raise Exception("Gemini: " + str(
+            data.get("error", {}).get("message", r.status_code))[:200])
+    return data
+
+
+def gemini_image_from(data):
+    for cand in data.get("candidates", []):
+        for part in cand.get("content", {}).get("parts", []):
+            inl = part.get("inlineData") or part.get("inline_data")
+            if inl and inl.get("data"):
+                return load_pil(base64.b64decode(inl["data"]))
+    return None
+
+
+def img_part(img):
+    jpg = to_bytes(flatten_white(img), "JPEG")
+    return {"inline_data": {"mime_type": "image/jpeg",
+                            "data": base64.b64encode(jpg).decode()}}
+
+
+def gemini_edit(img, prompt):
+    data = gemini_call(GEMINI_IMAGE_MODEL,
+                       [{"text": prompt + ". Keep it high quality and print ready."},
+                        img_part(img)],
+                       {"responseModalities": ["TEXT", "IMAGE"]})
+    out = gemini_image_from(data)
+    if out is None:
+        raise Exception("Gemini returned no image")
+    return out
+
+
+def gemini_person_box(img):
+    q = ("Find the portrait photo of the main person (face, hair, shoulders "
+         "and upper body) inside this image. Ignore text, logos and graphics. "
+         "Return ONLY JSON like {\"box_2d\":[ymin,xmin,ymax,xmax]} with "
+         "values normalized from 0 to 1000.")
+    data = gemini_call(GEMINI_TEXT_MODEL, [{"text": q}, img_part(img)],
+                       {"responseMimeType": "application/json"}, 90)
+    text = ""
+    for part in data["candidates"][0]["content"]["parts"]:
+        text += part.get("text", "")
+    obj = json.loads(text)
+    if isinstance(obj, list):
+        obj = obj[0]
+    box = obj.get("box_2d") or obj.get("box")
+    ymin, xmin, ymax, xmax = [float(v) / 1000.0 for v in box]
+    return ymin, xmin, ymax, xmax
+
+
+# ---------------- बाकी APIs ----------------
+
+def generate_design(prompt, w=1024, h=1024):
+    url = ("https://image.pollinations.ai/prompt/" + requests.utils.quote(prompt)
+           + f"?width={w}&height={h}&nologo=true")
     r = requests.get(url, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
     if r.status_code != 200:
         raise Exception(f"Design generation error {r.status_code}")
     return load_pil(r.content)
 
 
-def gemini_edit(img, prompt):
-    if not key_ok(GEMINI_KEY):
-        raise Exception("GEMINI_KEY not set in main.py")
-    jpg = to_bytes(flatten_white(img), "JPEG")
-    payload = {
-        "contents": [{"parts": [
-            {"text": prompt + ". Keep it high quality and print ready."},
-            {"inline_data": {"mime_type": "image/jpeg",
-                             "data": base64.b64encode(jpg).decode()}},
-        ]}],
-        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
-    }
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           + GEMINI_IMAGE_MODEL + ":generateContent")
-    r = requests.post(url, params={"key": GEMINI_KEY}, json=payload, timeout=180)
-    data = r.json()
-    for cand in data.get("candidates", []):
-        for part in cand.get("content", {}).get("parts", []):
-            inl = part.get("inlineData") or part.get("inline_data")
-            if inl and inl.get("data"):
-                return load_pil(base64.b64decode(inl["data"]))
-    msg = data.get("error", {}).get("message", "No image returned")
-    raise Exception("Gemini: " + msg[:200])
+def generate_image(prompt, aspect="2:3", w=1024, h=1536):
+    if key_ok(GEMINI_KEY):
+        try:
+            cfg = {"responseModalities": ["TEXT", "IMAGE"],
+                   "imageConfig": {"aspectRatio": aspect}}
+            try:
+                data = gemini_call(GEMINI_IMAGE_MODEL, [{"text": prompt}], cfg)
+            except Exception:
+                data = gemini_call(GEMINI_IMAGE_MODEL, [{"text": prompt}],
+                                   {"responseModalities": ["TEXT", "IMAGE"]})
+            img = gemini_image_from(data)
+            if img is not None:
+                return img
+        except Exception:
+            pass
+    return generate_design(prompt, w, h)
 
 
-def remove_background(img):
+def remove_background(img, person=False):
+    data = {"size": "auto"}
+    if person:
+        data["type"] = "person"
     r = requests.post(
         "https://api.remove.bg/v1.0/removebg",
         files={"image_file": ("img.png", to_bytes(img, "PNG"))},
-        data={"size": "auto"},
-        headers={"X-Api-Key": REMOVEBG_KEY}, timeout=120)
+        data=data, headers={"X-Api-Key": REMOVEBG_KEY}, timeout=120)
     if r.status_code == 200:
         return load_pil(r.content)
     try:
@@ -150,6 +229,86 @@ def remove_background(img):
     except Exception:
         msg = f"HTTP {r.status_code}"
     raise Exception("remove.bg: " + msg)
+
+
+def remove_plain_bg(img, tol=40):
+    """सादा/एक रंग का बैकग्राउंड हटाता है (AI के बिना, लोगो/स्टिकर के लिए)"""
+    im = img.convert("RGBA")
+    rgb = im.convert("RGB")
+    w, h = im.size
+    bgc = rgb.getpixel((0, 0))
+    diff = ImageChops.difference(rgb, PILImage.new("RGB", im.size, bgc))
+    r, g, b = diff.split()
+    d = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    sim = d.point(lambda v: 255 if v <= tol else 0)
+    s = 256.0 / max(w, h)
+    sw, sh = max(2, int(w * s)), max(2, int(h * s))
+    small = sim.resize((sw, sh), PILImage.NEAREST)
+    for pt in [(0, 0), (sw - 1, 0), (0, sh - 1), (sw - 1, sh - 1)]:
+        if small.getpixel(pt) == 255:
+            ImageDraw.floodfill(small, pt, 128)
+    conn = small.point(lambda v: 255 if v == 128 else 0)
+    conn = conn.filter(ImageFilter.MaxFilter(3))
+    conn = conn.resize((w, h), PILImage.NEAREST)
+    mask = ImageChops.darker(conn, sim)
+    mask = mask.filter(ImageFilter.GaussianBlur(0.8))
+    new_a = ImageChops.multiply(im.split()[3], ImageChops.invert(mask))
+    im.putalpha(new_a)
+    return im
+
+
+def clean_edges(img):
+    """किनारे की 1 पिक्सेल की झालर हटाता है"""
+    r, g, b, a = img.convert("RGBA").split()
+    a = a.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.7))
+    return PILImage.merge("RGBA", (r, g, b, a))
+
+
+def extract_person(img):
+    """पोस्टर/फ़ोटो में से सिर्फ़ व्यक्ति. return (cut, aligned_source, note)"""
+    work = img
+    note = ""
+    try:
+        ymin, xmin, ymax, xmax = gemini_person_box(img)
+        m = 0.03
+        l = max(0, int((xmin - m) * img.width))
+        t = max(0, int((ymin - m) * img.height))
+        r = min(img.width, int((xmax + m) * img.width))
+        b = min(img.height, int((ymax + m) * img.height))
+        if r - l > 40 and b - t > 40:
+            work = img.crop((l, t, r, b))
+        else:
+            note = "crop box too small"
+    except Exception as e:
+        note = "auto-crop skipped: " + str(e)[:60]
+    cut = remove_background(work, person=True)
+    return cut, align_src(work, cut), note
+
+
+def hd_upscale(img):
+    rgba = img.convert("RGBA")
+    alpha = rgba.split()[3]
+    src = rgba.convert("RGB")
+    if max(src.size) > 1200:
+        s = 1200.0 / max(src.size)
+        src = src.resize((int(src.width * s), int(src.height * s)),
+                         PILImage.LANCZOS)
+    try:
+        if not key_ok(DEEPAI_KEY):
+            raise Exception("DEEPAI_KEY not set")
+        r = requests.post("https://api.deepai.org/api/torch-srgan",
+                          files={"image": ("in.png", to_bytes(src, "PNG"))},
+                          headers={"api-key": DEEPAI_KEY}, timeout=180)
+        data = r.json()
+        url = data.get("output_url")
+        if not url:
+            raise Exception(str(data.get("err") or data)[:100])
+        out = requests.get(url, timeout=180)
+        hd = load_pil(out.content, 4096).convert("RGBA")
+        hd.putalpha(alpha.resize(hd.size, PILImage.LANCZOS))
+        return hd, "DeepAI"
+    except Exception as e:
+        return enhance_for_print(img, 3000), "Local (DeepAI: " + str(e)[:70] + ")"
 
 
 def vectorize_pdf(png_bytes):
@@ -163,6 +322,33 @@ def vectorize_pdf(png_bytes):
     if r.status_code == 200:
         return r.content
     raise Exception(f"Vectorizer {r.status_code}: {r.text[:120]}")
+
+
+# ---------------- डिज़ाइन बनाना ----------------
+
+def compose_design(bg, person, size_pct, xpct, ypct):
+    bg = bg.convert("RGBA")
+    if bg.height < 3000:
+        s = 3072.0 / bg.height
+        bg = bg.resize((int(bg.width * s), 3072), PILImage.LANCZOS)
+    p = person.convert("RGBA")
+    ph = int(bg.height * size_pct / 100.0)
+    r = ph / float(p.height)
+    pw = int(p.width * r)
+    if pw > bg.width * 0.98:
+        r = bg.width * 0.98 / p.width
+        pw, ph = int(p.width * r), int(p.height * r)
+    p = p.resize((max(1, pw), max(1, ph)), PILImage.LANCZOS)
+    x0 = int(bg.width * xpct / 100.0 - pw / 2.0)
+    y0 = int(bg.height * ypct / 100.0 - ph / 2.0)
+    a = p.split()[3]
+    sh = a.filter(ImageFilter.GaussianBlur(max(2, ph / 70.0))).point(
+        lambda v: int(v * 0.45))
+    out = bg.copy()
+    out.paste(PILImage.new("RGBA", p.size, (0, 0, 0, 255)),
+              (x0 + int(pw * 0.02), y0 + int(ph * 0.02)), sh)
+    out.paste(p, (x0, y0), a)
+    return out
 
 
 # ---------------- टेक्स्ट रेंडर (हिंदी + English) ----------------
@@ -201,7 +387,8 @@ def render_run(text, is_deva, px):
         return PILImage.new("L", (max(2, px // 3), px), 0)
     w, h = tex.size
     im = PILImage.frombytes("RGBA", (w, h), tex.pixels)
-    im = im.transpose(PILImage.FLIP_TOP_BOTTOM)
+    if FLIP_TEXT:
+        im = im.transpose(PILImage.FLIP_TOP_BOTTOM)
     return im.split()[3]
 
 
@@ -264,7 +451,6 @@ def apply_text(base, text, color, outline, size_pct, xpct, ypct):
 # ---------------- फ़ाइल सेव ----------------
 
 def save_file(app, name, data, mime):
-    """Android: Download/AIDesign में सेव. return (label, uri)"""
     if platform == "android":
         try:
             from jnius import autoclass
@@ -300,6 +486,180 @@ def read_uri_bytes(uri):
         return f.read()
 
 
+# ---------------- करेक्शन एडिटर ----------------
+
+_MASKS = {}
+
+
+def _circle_mask(r):
+    if r not in _MASKS:
+        m = PILImage.new("L", (2 * r + 1, 2 * r + 1), 0)
+        ImageDraw.Draw(m).ellipse((0, 0, 2 * r, 2 * r), fill=255)
+        _MASKS[r] = m
+    return _MASKS[r]
+
+
+def brush_apply(img, src, mode, x, y, r):
+    r = max(1, int(r))
+    x, y = int(x), int(y)
+    bx0, by0 = x - r, y - r
+    l, t = max(0, bx0), max(0, by0)
+    rr, bb = min(img.width, x + r + 1), min(img.height, y + r + 1)
+    if rr <= l or bb <= t:
+        return
+    m = _circle_mask(r).crop((l - bx0, t - by0, rr - bx0, bb - by0))
+    if mode == "erase":
+        img.paste((0, 0, 0, 0), (l, t, rr, bb), m)
+    elif src is not None:
+        img.paste(src.crop((l, t, rr, bb)), (l, t), m)
+
+
+class EditCanvas(StencilView):
+    def __init__(self, full, src, **kw):
+        super().__init__(**kw)
+        self.full = full.convert("RGBA")
+        self.src = src
+        self.fw, self.fh = self.full.size
+        self.ds = min(1.0, 1100.0 / max(self.fw, self.fh))
+        dw, dh = max(1, int(self.fw * self.ds)), max(1, int(self.fh * self.ds))
+        self.disp0 = self.full.resize((dw, dh), PILImage.LANCZOS)
+        self.disp_src = (src.resize((dw, dh), PILImage.LANCZOS)
+                         if src is not None else None)
+        self.disp = self.disp0.copy()
+        self.ops = []
+        self.cur = None
+        self.mode = "erase"
+        self.radius = max(3, int(self.fw * 0.02))
+        self.zoom = 1.0
+        self.pan = [0.0, 0.0]
+        self.s = 1.0
+        self.ox = self.oy = 0.0
+        self.bg_choices = [(0.8, 0.8, 0.8), (1, 1, 1), (0, 0, 0), (0, 0.7, 0.2)]
+        self.bg_i = 0
+        self.tex = Texture.create(size=(dw, dh), colorfmt="rgba")
+        self.tex.flip_vertical()
+        with self.canvas:
+            self.bg_color = Color(*self.bg_choices[0], 1)
+            self.bg_rect = Rectangle(pos=self.pos, size=self.size)
+            Color(1, 1, 1, 1)
+            self.img_rect = Rectangle(texture=self.tex, pos=(0, 0), size=(10, 10))
+            Color(1, 0.2, 0.2, 1)
+            self.cursor = Line(circle=(0, 0, 0), width=1.5)
+        self.bind(pos=self.relayout, size=self.relayout)
+        self.update_tex()
+        self.relayout()
+
+    def relayout(self, *a):
+        fit = min(self.width / float(self.fw), self.height / float(self.fh))
+        self.s = max(1e-6, fit * self.zoom)
+        iw, ih = self.fw * self.s, self.fh * self.s
+        self.ox = self.x + (self.width - iw) / 2.0 + self.pan[0]
+        self.oy = self.y + (self.height - ih) / 2.0 + self.pan[1]
+        self.bg_rect.pos = self.pos
+        self.bg_rect.size = self.size
+        self.img_rect.pos = (self.ox, self.oy)
+        self.img_rect.size = (iw, ih)
+
+    def update_tex(self):
+        self.tex.blit_buffer(self.disp.tobytes(), colorfmt="rgba",
+                             bufferfmt="ubyte")
+        self.canvas.ask_update()
+
+    def to_img(self, tx, ty):
+        return (tx - self.ox) / self.s, self.fh - (ty - self.oy) / self.s
+
+    def add_point(self, ix, iy):
+        c = self.cur
+        c["pts"].append((ix, iy))
+        brush_apply(self.disp, self.disp_src, c["mode"],
+                    ix * self.ds, iy * self.ds, max(1, c["r"] * self.ds))
+
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return False
+        touch.grab(self)
+        if self.mode == "move":
+            return True
+        self.cur = {"mode": self.mode, "r": self.radius, "pts": []}
+        ix, iy = self.to_img(*touch.pos)
+        self.cur["last"] = (ix, iy)
+        self.add_point(ix, iy)
+        self.cursor.circle = (touch.x, touch.y, self.radius * self.s)
+        self.update_tex()
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is not self:
+            return False
+        if self.mode == "move":
+            self.pan[0] += touch.dx
+            self.pan[1] += touch.dy
+            self.relayout()
+            return True
+        if self.cur is None:
+            return True
+        ix, iy = self.to_img(*touch.pos)
+        lx, ly = self.cur["last"]
+        dist = ((ix - lx) ** 2 + (iy - ly) ** 2) ** 0.5
+        step = max(1.0, self.cur["r"] * 0.35)
+        n = max(1, int(dist / step))
+        for i in range(1, n + 1):
+            f = i / float(n)
+            self.add_point(lx + (ix - lx) * f, ly + (iy - ly) * f)
+        self.cur["last"] = (ix, iy)
+        self.cursor.circle = (touch.x, touch.y, self.radius * self.s)
+        self.update_tex()
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is not self:
+            return False
+        touch.ungrab(self)
+        if self.cur is not None and self.cur["pts"]:
+            self.ops.append(("stroke", self.cur))
+        self.cur = None
+        return True
+
+    def zoom_by(self, f):
+        self.zoom = max(1.0, min(8.0, self.zoom * f))
+        if self.zoom == 1.0:
+            self.pan = [0.0, 0.0]
+        self.relayout()
+
+    def next_backdrop(self):
+        self.bg_i = (self.bg_i + 1) % len(self.bg_choices)
+        self.bg_color.rgba = (*self.bg_choices[self.bg_i], 1)
+
+    def do_clean(self):
+        self.ops.append(("clean", None))
+        self.disp = clean_edges(self.disp)
+        self.update_tex()
+
+    def undo(self):
+        if not self.ops:
+            return
+        self.ops.pop()
+        self.disp = self.disp0.copy()
+        for kind, c in self.ops:
+            if kind == "stroke":
+                for (x, y) in c["pts"]:
+                    brush_apply(self.disp, self.disp_src, c["mode"],
+                                x * self.ds, y * self.ds, max(1, c["r"] * self.ds))
+            else:
+                self.disp = clean_edges(self.disp)
+        self.update_tex()
+
+    def result(self):
+        out = self.full.copy()
+        for kind, c in self.ops:
+            if kind == "stroke":
+                for (x, y) in c["pts"]:
+                    brush_apply(out, self.src, c["mode"], x, y, c["r"])
+            else:
+                out = clean_edges(out)
+        return out
+
+
 # ---------------- UI ----------------
 
 class Preview(BoxLayout):
@@ -315,26 +675,21 @@ class Preview(BoxLayout):
         self.rect.size = self.size
 
 
-def mk_btn(hi, en, cb, h=52, color=None):
-    b = Button(text=bi(hi, en, sep="\n"), markup=True, halign="center",
-               size_hint_y=None, height=dp(h))
-    if color:
-        b.background_color = color
-    b.bind(on_press=cb)
-    return b
-
-
 def mk_label(hi, en, h=30):
     return Label(text=bi(hi, en), markup=True, size_hint_y=None, height=dp(h))
 
 
 class DesignApp(App):
     base = None
+    person = None
+    person_src = None
+    bg = None
     final = None
     history = []
     last_uri = None
     last_mime = "application/pdf"
     camera_uri = None
+    photo_loaded = False
 
     def build(self):
         self.title = "AI Design Studio"
@@ -355,31 +710,45 @@ class DesignApp(App):
             self.action_btns.append(b)
         root.add_widget(row)
 
-        pv = Preview(size_hint_y=None, height=dp(300), padding=dp(2))
+        pv = Preview(size_hint_y=None, height=dp(320), padding=dp(2))
         self.preview = Image()
         pv.add_widget(self.preview)
         root.add_widget(pv)
 
-        root.add_widget(mk_label("2) क्या बदलना/बनाना है (English बेहतर)",
-                                 "2) What to change/create", 34))
+        root.add_widget(mk_label("2) कटिंग और करेक्शन", "2) Cutting & correction", 34))
+        self._row(root, [
+            ("व्यक्ति अलग करें", "Extract Person", self.on_extract, (0.9, 0.5, 0.1, 1)),
+            ("बैकग्राउंड काटें (AI)", "Cut Background (AI)", self.on_cut, (0.7, 0.4, 0.1, 1))])
+        self.tol_sl = self._slider(root, "सहनशीलता", "Tolerance", 5, 120, 40)
+        self._row(root, [
+            ("सादा बैकग्राउंड हटाएँ", "Remove Plain BG", self.on_plain, (0.6, 0.3, 0.6, 1)),
+            ("करेक्शन करें", "Edit / Correct", self.open_editor, (0.1, 0.6, 0.5, 1))])
+        self._row(root, [
+            ("HD बनाएँ", "Make HD", self.on_hd, (0.2, 0.6, 1, 1)),
+            ("पिछला वापस", "Undo", self.on_undo, None)], track=False)
+
+        root.add_widget(mk_label("3) नया डिज़ाइन (English/Hinglish)",
+                                 "3) New design", 34))
         self.prompt_input = TextInput(
-            hint_text="e.g. make it a cartoon lion logo, red tshirt design",
+            hint_text="e.g. purple gold luxury achiever poster background",
             multiline=True, size_hint_y=None, height=dp(80))
         root.add_widget(self.prompt_input)
-        r2 = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
-        for hi, en, cb, col in [
-                ("AI डिज़ाइन / बदलाव", "AI Design / Edit", self.on_ai, (0.2, 0.6, 1, 1)),
-                ("बैकग्राउंड काटें", "Cut Background", self.on_cut, (0.9, 0.5, 0.1, 1))]:
-            b = Button(text=bi(hi, en, sep="\n"), markup=True, halign="center",
-                       background_color=col)
-            b.bind(on_press=cb)
-            r2.add_widget(b)
-            self.action_btns.append(b)
-        root.add_widget(r2)
-        ub = mk_btn("पिछला वापस (Undo)", "Undo", self.on_undo, 44)
-        root.add_widget(ub)
+        auto = Button(
+            text=bi("AUTO: व्यक्ति अलग + HD + नया डिज़ाइन",
+                    "AUTO: Person + HD + New Design", sep="\n"),
+            markup=True, halign="center", size_hint_y=None, height=dp(64),
+            background_color=(0.1, 0.7, 0.3, 1))
+        auto.bind(on_press=self.on_auto)
+        root.add_widget(auto)
+        self.action_btns.append(auto)
+        self._row(root, [
+            ("नया डिज़ाइन", "New Design", self.on_design, (0.2, 0.4, 0.9, 1)),
+            ("AI से फ़ोटो बदलें", "AI Edit photo", self.on_ai_edit, None)])
+        self.p_size = self._slider(root, "व्यक्ति आकार", "Person size", 30, 95, 74)
+        self.p_x = self._slider(root, "व्यक्ति बाएँ-दाएँ", "Person L-R", 0, 100, 50)
+        self.p_y = self._slider(root, "व्यक्ति ऊपर-नीचे", "Person U-D", 0, 100, 60)
 
-        root.add_widget(mk_label("3) टेक्स्ट लिखें", "3) Add text", 34))
+        root.add_widget(mk_label("4) टेक्स्ट लिखें", "4) Add text", 34))
         self.hi_input = TextInput(
             hint_text=("यहाँ हिंदी में लिखें" if HAS_FONT else "Hindi text"),
             font_name=(FONT_PATH if HAS_FONT else "Roboto"),
@@ -389,7 +758,6 @@ class DesignApp(App):
             hint_text="Write English text here", multiline=True,
             size_hint_y=None, height=dp(70))
         root.add_widget(self.en_input)
-
         self.color_sp = Spinner(text="White", values=list(COLORS.keys()),
                                 size_hint_y=None, height=dp(44))
         root.add_widget(self.color_sp)
@@ -398,25 +766,16 @@ class DesignApp(App):
             values=["No outline", "Black outline", "White outline"],
             size_hint_y=None, height=dp(44))
         root.add_widget(self.outline_sp)
-
-        self.size_sl = self._slider(root, "आकार", "Size", 3, 40, 9)
+        self.size_sl = self._slider(root, "आकार", "Size", 3, 40, 6)
         self.x_sl = self._slider(root, "बाएँ-दाएँ", "Left-Right", 0, 100, 50)
-        self.y_sl = self._slider(root, "ऊपर-नीचे", "Up-Down", 0, 100, 85)
+        self.y_sl = self._slider(root, "ऊपर-नीचे", "Up-Down", 0, 100, 90)
+        self._row(root, [("टेक्स्ट जोड़ें", "Add Text", self.on_add_text, None),
+                         ("टेक्स्ट हटाएँ", "Remove Text", self.on_remove_text, None)],
+                  track=False)
 
-        r3 = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
-        b1 = Button(text=bi("टेक्स्ट जोड़ें", "Add Text", sep="\n"),
-                    markup=True, halign="center")
-        b1.bind(on_press=self.on_add_text)
-        b2 = Button(text=bi("टेक्स्ट हटाएँ", "Remove Text", sep="\n"),
-                    markup=True, halign="center")
-        b2.bind(on_press=self.on_remove_text)
-        r3.add_widget(b1)
-        r3.add_widget(b2)
-        root.add_widget(r3)
-
-        root.add_widget(mk_label("4) सेव / भेजें", "4) Save / Send", 34))
-        r4 = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
-        for hi, en, kind in [("PNG सेव", "Save PNG", "png"),
+        root.add_widget(mk_label("5) सेव / भेजें", "5) Save / Send", 34))
+        r4 = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
+        for hi, en, kind in [("PNG सेव (शर्ट प्रिंट)", "Save PNG (transparent)", "png"),
                              ("PDF सेव", "Save PDF", "pdf")]:
             b = Button(text=bi(hi, en, sep="\n"), markup=True, halign="center")
             b.bind(on_press=lambda inst, k=kind: self.export(k))
@@ -429,11 +788,15 @@ class DesignApp(App):
         vb.bind(on_press=lambda inst: self.export("vector"))
         root.add_widget(vb)
         self.action_btns.append(vb)
-        root.add_widget(mk_btn("पिछली फ़ाइल शेयर करें", "Share last file",
-                               self.share_last, 52, (0.2, 0.7, 0.3, 1)))
+        sb = Button(text=bi("पिछली फ़ाइल शेयर करें", "Share last file", sep="\n"),
+                    markup=True, halign="center", size_hint_y=None,
+                    height=dp(52), background_color=(0.2, 0.7, 0.3, 1))
+        sb.bind(on_press=self.share_last)
+        root.add_widget(sb)
 
         self.status = Label(text=bi("तैयार", "Ready"), markup=True,
-                            size_hint_y=None, height=dp(40))
+                            size_hint_y=None, height=dp(60))
+        self.status.bind(size=lambda w, s: setattr(w, "text_size", s))
         root.add_widget(self.status)
 
         if platform == "android":
@@ -444,10 +807,22 @@ class DesignApp(App):
                 pass
         return scroll
 
+    def _row(self, root, items, track=True):
+        row = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
+        for hi, en, cb, col in items:
+            b = Button(text=bi(hi, en, sep="\n"), markup=True, halign="center")
+            if col:
+                b.background_color = col
+            b.bind(on_press=cb)
+            row.add_widget(b)
+            if track:
+                self.action_btns.append(b)
+        root.add_widget(row)
+
     def _slider(self, root, hi, en, mn, mx, val):
         row = BoxLayout(size_hint_y=None, height=dp(40))
         row.add_widget(Label(text=bi(hi, en), markup=True,
-                             size_hint_x=None, width=dp(130)))
+                             size_hint_x=None, width=dp(150)))
         sl = Slider(min=mn, max=mx, value=val)
         row.add_widget(sl)
         root.add_widget(row)
@@ -458,6 +833,12 @@ class DesignApp(App):
         c = Label(text=msg, markup=True, halign="center")
         c.bind(size=lambda w, s: setattr(w, "text_size", s))
         Popup(title="Info", content=c, size_hint=(0.88, 0.4)).open()
+
+    def ui(self, fn):
+        Clock.schedule_once(lambda dt: fn())
+
+    def say(self, msg):
+        self.ui(lambda: setattr(self.status, "text", msg))
 
     def busy(self, msg):
         self.status.text = msg
@@ -471,8 +852,7 @@ class DesignApp(App):
 
     def fail(self, e):
         msg = bi("त्रुटि", "Error", sep=": ") + "\n" + escape_markup(str(e))[:300]
-        Clock.schedule_once(lambda dt: (self.popup(msg),
-                                        self.done(bi("फेल", "Failed"))))
+        self.ui(lambda: (self.popup(msg), self.done(bi("फेल", "Failed"))))
 
     def refresh_preview(self):
         img = self.final if self.final is not None else self.base
@@ -488,10 +868,32 @@ class DesignApp(App):
     def set_base(self, img, push=True):
         if push and self.base is not None:
             self.history.append(self.base)
-            self.history = self.history[-6:]
+            self.history = self.history[-4:]
         self.base = img
         self.final = None
         self.refresh_preview()
+
+    def _set_person_base(self, person, base, src=None, clear_bg=True):
+        self.person = person
+        if src is not None:
+            self.person_src = src
+        if clear_bg:
+            self.bg = None
+        self.photo_loaded = False
+        self.set_base(base)
+
+    def _need_base(self):
+        if self.base is None:
+            self.popup(bi("पहले फ़ोटो चुनें", "Choose a photo first"))
+            return False
+        return True
+
+    def _prompt(self):
+        p = self.prompt_input.text.strip()
+        if not p:
+            self.popup(bi("पहले डिज़ाइन का विवरण लिखें",
+                          "Write the design description first"))
+        return p
 
     # ---------- फ़ोटो चुनना ----------
     def pick_gallery(self, *a):
@@ -553,43 +955,169 @@ class DesignApp(App):
         try:
             img = load_pil(read_uri_bytes(uri))
             self.history = []
+            self.person = None
+            self.person_src = None
+            self.bg = None
+            self.photo_loaded = True
             self.set_base(img, push=False)
             self.done(bi("फ़ोटो लोड हो गई", "Photo loaded"))
         except Exception as e:
             self.popup("Load error: " + escape_markup(str(e)))
 
-    # ---------- AI / कटिंग ----------
-    def on_ai(self, *a):
-        prompt = self.prompt_input.text.strip()
-        if not prompt:
-            self.popup(bi("पहले प्रॉम्प्ट लिखें", "Write a prompt first"))
+    # ---------- AUTO ----------
+    def on_auto(self, *a):
+        if not self._need_base():
             return
-        self.busy(bi("AI काम कर रहा है...", "AI is working..."))
-        threading.Thread(target=self._ai_worker, args=(prompt, self.base),
+        prompt = self._prompt()
+        if not prompt:
+            return
+        self.busy(bi("AUTO चल रहा है...", "AUTO running..."))
+        threading.Thread(
+            target=self._auto_worker,
+            args=(prompt, self.base, self.p_size.value, self.p_x.value,
+                  self.p_y.value), daemon=True).start()
+
+    def _auto_worker(self, prompt, img, size, x, y):
+        try:
+            self.say(bi("1/3 व्यक्ति अलग कर रहा है...", "1/3 Extracting person..."))
+            cut, src, note = extract_person(img)
+            self.ui(lambda: self._set_person_base(cut, cut, src=src))
+            self.say(bi("2/3 HD बना रहा है...", "2/3 Making HD..."))
+            hd, hsrc = hd_upscale(cut)
+            self.ui(lambda: self._set_person_base(hd, hd))
+            self.say(bi("3/3 नया डिज़ाइन बना रहा है...", "3/3 Creating design..."))
+            bg = generate_image(
+                prompt + ". Poster background design only, vibrant, professional, "
+                "no people, no text, empty space in the center.")
+            out = compose_design(bg, hd, size, x, y)
+            self.ui(lambda: setattr(self, "bg", bg))
+            self.ui(lambda: self._set_person_base(hd, out, clear_bg=False))
+            msg = bi("पूरा हुआ!", "All done!") + "  [HD: " + escape_markup(hsrc) + "]"
+            if note:
+                msg += "\n" + escape_markup(note)
+            self.ui(lambda: self.done(msg))
+        except Exception as e:
+            self.fail(e)
+
+    # ---------- कटिंग ----------
+    def on_extract(self, *a):
+        if not self._need_base():
+            return
+        self.busy(bi("व्यक्ति अलग कर रहा है...", "Extracting person..."))
+        threading.Thread(target=self._extract_worker, args=(self.base,),
                          daemon=True).start()
 
-    def _ai_worker(self, prompt, base):
+    def _extract_worker(self, img):
         try:
-            img = generate_design(prompt) if base is None else gemini_edit(base, prompt)
-            Clock.schedule_once(lambda dt: self.set_base(img))
-            Clock.schedule_once(lambda dt: self.done(bi("हो गया!", "Done!")))
+            cut, src, note = extract_person(img)
+            self.ui(lambda: self._set_person_base(cut, cut, src=src))
+            msg = bi("व्यक्ति अलग हो गया", "Person extracted")
+            if note:
+                msg += "\n" + escape_markup(note)
+            self.ui(lambda: self.done(msg))
         except Exception as e:
             self.fail(e)
 
     def on_cut(self, *a):
-        if self.base is None:
-            self.popup(bi("पहले फ़ोटो चुनें या डिज़ाइन बनाएँ",
-                          "Pick a photo or create a design first"))
+        if not self._need_base():
             return
         self.busy(bi("बैकग्राउंड हटा रहा है...", "Removing background..."))
         threading.Thread(target=self._cut_worker, args=(self.base,),
                          daemon=True).start()
 
-    def _cut_worker(self, base):
+    def _cut_worker(self, img):
         try:
-            img = remove_background(base)
-            Clock.schedule_once(lambda dt: self.set_base(img))
-            Clock.schedule_once(lambda dt: self.done(bi("कटिंग हो गई!", "Cut done!")))
+            cut = remove_background(img)
+            src = align_src(img, cut)
+            self.ui(lambda: self._set_person_base(cut, cut, src=src))
+            self.ui(lambda: self.done(bi("कटिंग हो गई!", "Cut done!")))
+        except Exception as e:
+            self.fail(e)
+
+    def on_plain(self, *a):
+        if not self._need_base():
+            return
+        self.busy(bi("सादा बैकग्राउंड हटा रहा है...", "Removing plain background..."))
+        threading.Thread(target=self._plain_worker,
+                         args=(self.base, int(self.tol_sl.value)),
+                         daemon=True).start()
+
+    def _plain_worker(self, img, tol):
+        try:
+            out = remove_plain_bg(img, tol)
+            src = img.convert("RGBA")
+            self.ui(lambda: self._set_person_base(out, out, src=src))
+            self.ui(lambda: self.done(bi(
+                "हो गया. बचा हुआ हिस्सा 'करेक्शन करें' से ठीक करें",
+                "Done. Fix leftovers with 'Edit / Correct'")))
+        except Exception as e:
+            self.fail(e)
+
+    # ---------- HD / डिज़ाइन ----------
+    def on_hd(self, *a):
+        if not self._need_base():
+            return
+        self.busy(bi("HD बना रहा है...", "Making HD..."))
+        is_person = self.person is not None and self.base is self.person
+        threading.Thread(target=self._hd_worker, args=(self.base, is_person),
+                         daemon=True).start()
+
+    def _hd_worker(self, img, is_person):
+        try:
+            hd, src = hd_upscale(img)
+            if is_person:
+                self.ui(lambda: self._set_person_base(hd, hd))
+            else:
+                self.ui(lambda: self.set_base(hd))
+            self.ui(lambda: self.done(bi("HD हो गया", "HD done")
+                                      + "  [" + escape_markup(src) + "]"))
+        except Exception as e:
+            self.fail(e)
+
+    def on_design(self, *a):
+        prompt = self._prompt()
+        if not prompt:
+            return
+        if self.person is None and self.photo_loaded:
+            self.popup(bi("पहले 'व्यक्ति अलग करें' दबाइए, ताकि आपकी फ़ोटो डिज़ाइन में लगे",
+                          "Press 'Extract Person' first so your photo is used"))
+            return
+        self.busy(bi("डिज़ाइन बना रहा है...", "Creating design..."))
+        threading.Thread(
+            target=self._design_worker,
+            args=(prompt, self.person, self.p_size.value, self.p_x.value,
+                  self.p_y.value), daemon=True).start()
+
+    def _design_worker(self, prompt, person, size, x, y):
+        try:
+            if person is not None:
+                bg = generate_image(
+                    prompt + ". Poster background design only, vibrant, "
+                    "professional, no people, no text, empty space in the center.")
+                out = compose_design(bg, person, size, x, y)
+                self.ui(lambda: setattr(self, "bg", bg))
+            else:
+                out = generate_image(prompt + ". High quality, print ready design.")
+            self.ui(lambda: self.set_base(out))
+            self.ui(lambda: self.done(bi("डिज़ाइन तैयार", "Design ready")))
+        except Exception as e:
+            self.fail(e)
+
+    def on_ai_edit(self, *a):
+        if not self._need_base():
+            return
+        prompt = self._prompt()
+        if not prompt:
+            return
+        self.busy(bi("AI बदलाव कर रहा है...", "AI editing..."))
+        threading.Thread(target=self._edit_worker, args=(prompt, self.base),
+                         daemon=True).start()
+
+    def _edit_worker(self, prompt, img):
+        try:
+            out = gemini_edit(img, prompt)
+            self.ui(lambda: self.set_base(out))
+            self.ui(lambda: self.done(bi("हो गया!", "Done!")))
         except Exception as e:
             self.fail(e)
 
@@ -598,6 +1126,101 @@ class DesignApp(App):
             self.base = self.history.pop()
             self.final = None
             self.refresh_preview()
+
+    # ---------- करेक्शन एडिटर ----------
+    def open_editor(self, *a):
+        target = self.person if self.person is not None else self.base
+        if target is None:
+            self.popup(bi("पहले फ़ोटो चुनें और काटें", "Choose and cut a photo first"))
+            return
+        src = None
+        if self.person is not None and self.person_src is not None:
+            src = align_src(self.person_src, target)
+        ed = EditCanvas(target, src)
+        view = ModalView(size_hint=(1, 1), auto_dismiss=False)
+        box = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
+
+        modes = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
+
+        def set_mode(m):
+            ed.mode = m
+
+        for hi, en, m in [("मिटाएँ", "Erase", "erase"),
+                          ("वापस लाएँ", "Restore", "restore"),
+                          ("खिसकाएँ", "Move", "move")]:
+            tb = ToggleButton(text=bi(hi, en, sep="\n"), markup=True,
+                              halign="center", group="editmode",
+                              allow_no_selection=False,
+                              state="down" if m == "erase" else "normal")
+            if m == "restore" and src is None:
+                tb.disabled = True
+            tb.bind(on_press=lambda inst, mm=m: set_mode(mm))
+            modes.add_widget(tb)
+        box.add_widget(modes)
+
+        tools = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        for text, cb in [("Zoom +", lambda *_: ed.zoom_by(1.5)),
+                         ("Zoom -", lambda *_: ed.zoom_by(1 / 1.5)),
+                         ("Backdrop", lambda *_: ed.next_backdrop()),
+                         ("Clean Edges", lambda *_: ed.do_clean())]:
+            b = Button(text=text)
+            b.bind(on_press=cb)
+            tools.add_widget(b)
+        box.add_widget(tools)
+
+        brow = BoxLayout(size_hint_y=None, height=dp(40))
+        brow.add_widget(Label(text=bi("ब्रश", "Brush"), markup=True,
+                               size_hint_x=None, width=dp(90)))
+        bs = Slider(min=0.5, max=10, value=2)
+        bs.bind(value=lambda inst, v: setattr(
+            ed, "radius", max(2, int(ed.fw * v / 200.0))))
+        brow.add_widget(bs)
+        box.add_widget(brow)
+
+        box.add_widget(ed)
+
+        def done_cb(*_):
+            try:
+                res = ed.result()
+            except Exception as e:
+                self.popup("Edit error: " + escape_markup(str(e)))
+                return
+            view.dismiss()
+            self._apply_edit(res)
+
+        bottom = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
+        ub = Button(text=bi("वापस", "Undo", sep="\n"), markup=True, halign="center")
+        ub.bind(on_press=lambda *_: ed.undo())
+        cb_ = Button(text=bi("रद्द", "Cancel", sep="\n"), markup=True, halign="center")
+        cb_.bind(on_press=lambda *_: view.dismiss())
+        db = Button(text=bi("हो गया", "Done", sep="\n"), markup=True,
+                    halign="center", background_color=(0.1, 0.7, 0.3, 1))
+        db.bind(on_press=done_cb)
+        for w in (ub, cb_, db):
+            bottom.add_widget(w)
+        box.add_widget(bottom)
+
+        view.add_widget(box)
+        view.open()
+
+    def _apply_edit(self, edited):
+        try:
+            if self.person is not None:
+                was_person_base = self.base is self.person
+                self.person = edited
+                if was_person_base:
+                    self.set_base(edited)
+                elif self.bg is not None:
+                    self.set_base(compose_design(
+                        self.bg, edited, self.p_size.value,
+                        self.p_x.value, self.p_y.value))
+                else:
+                    self.refresh_preview()
+            else:
+                self.set_base(edited)
+            self.status.text = bi("करेक्शन लागू हुआ", "Correction applied")
+        except Exception as e:
+            self.popup("Apply error: " + escape_markup(str(e)))
 
     # ---------- टेक्स्ट ----------
     def on_add_text(self, *a):
@@ -635,7 +1258,7 @@ class DesignApp(App):
         try:
             stamp = int(time.time())
             if kind == "png":
-                data = to_bytes(enhance_for_print(img), "PNG")
+                data = to_bytes(enhance_for_print(img), "PNG", dpi=300)
                 name, mime = "design_%d.png" % stamp, "image/png"
             elif kind == "pdf":
                 data = make_pdf(enhance_for_print(img))
@@ -643,7 +1266,7 @@ class DesignApp(App):
             else:
                 data = vectorize_pdf(to_bytes(img, "PNG"))
                 name, mime = "design_vector_%d.pdf" % stamp, "application/pdf"
-            Clock.schedule_once(lambda dt: self._finish_save(name, data, mime))
+            self.ui(lambda: self._finish_save(name, data, mime))
         except Exception as e:
             self.fail(e)
 
