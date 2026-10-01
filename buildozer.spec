@@ -4,11 +4,11 @@ package.name = aidesignstudio
 package.domain = com.yourcompany
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf
-version = 0.1
-requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,pillow,requests,urllib3,chardet,idna,certifi
+version = 0.2
+requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,pillow,requests,urllib3,chardet,idna,certifi,pyjnius
 orientation = portrait
 fullscreen = 0
-android.permissions = INTERNET
+android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
